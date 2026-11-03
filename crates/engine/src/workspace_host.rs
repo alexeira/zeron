@@ -29,6 +29,10 @@ use tokio::sync::watch;
 use zeron_doc::{DeletedSpace, REGISTRY_DOC_ID, RegistryDoc, WorkspaceDoc};
 use zeron_proto::projectless;
 use zeron_proto::{Chat, ChatConfig, Device, HarnessId, Session, SidebarPreferencesState, Space};
+use zeron_proto::{
+    MAX_TASK_NOTE_BYTES, MAX_TASK_TEXT_BYTES, NewTask, SessionTask, TaskUpdate, TaskWriteOutcome,
+    TaskWriteResult,
+};
 use zeron_sync::{DocsStore, RegistryClient, RegistryTuning};
 
 use crate::doc_host::EdgeConfig;
@@ -193,6 +197,7 @@ struct WorkspaceHostInner {
     devices_tx: watch::Sender<Vec<Device>>,
     sessions_tx: watch::Sender<Vec<Session>>,
     spaces_tx: watch::Sender<Vec<Space>>,
+    tasks_tx: watch::Sender<Vec<SessionTask>>,
     sidebar_preferences_tx: watch::Sender<SidebarPreferencesState>,
     room: Mutex<Option<Arc<RegistryClient>>>,
     /// Bumped on every registry change (local mutation or applied server
@@ -331,10 +336,12 @@ impl WorkspaceHost {
         })?;
 
         let state = doc.read_all()?;
+        let tasks = doc.read_tasks()?;
         let (chats_tx, _) = watch::channel(state.chats);
         let (devices_tx, _) = watch::channel(state.devices);
         let (sessions_tx, _) = watch::channel(state.sessions);
         let (spaces_tx, _) = watch::channel(state.spaces);
+        let (tasks_tx, _) = watch::channel(tasks);
         let preferences = doc.sidebar_preferences();
         let (sidebar_preferences_tx, _) = watch::channel(SidebarPreferencesState {
             revision: 0,
@@ -359,6 +366,7 @@ impl WorkspaceHost {
                 devices_tx,
                 sessions_tx,
                 spaces_tx,
+                tasks_tx,
                 sidebar_preferences_tx,
                 room: Mutex::new(None),
                 changed_tx,
@@ -744,6 +752,118 @@ impl WorkspaceHost {
         Ok(self.read(|doc| doc.read_sessions())?)
     }
 
+    pub fn task_board_id(&self, chat_id: &str) -> Result<String, EngineError> {
+        self.check_task_board(chat_id)?;
+        Ok(self.read(|doc| chat_board(doc, chat_id)))
+    }
+
+    pub fn read_tasks(&self, chat_id: &str) -> Result<Vec<SessionTask>, EngineError> {
+        self.check_task_board(chat_id)?;
+        Ok(self.read(|doc| doc.task_board(&chat_board(doc, chat_id)))?)
+    }
+
+    pub fn add_tasks(
+        &self,
+        origin_chat_id: &str,
+        new: &[NewTask],
+    ) -> Result<Vec<SessionTask>, EngineError> {
+        let board_chat_id = self.task_board_id(origin_chat_id)?;
+        let now = Utc::now();
+        let tasks: Vec<SessionTask> = new
+            .iter()
+            .map(|task| mint_task(origin_chat_id, &board_chat_id, task, now))
+            .collect::<Result<_, EngineError>>()?;
+        self.mutate(|doc| tasks.iter().try_for_each(|task| doc.upsert_task(task)))?;
+        Ok(tasks)
+    }
+
+    pub fn update_tasks(
+        &self,
+        origin_chat_id: &str,
+        updates: &[TaskUpdate],
+    ) -> Result<Vec<TaskWriteResult>, EngineError> {
+        let board_chat_id = self.task_board_id(origin_chat_id)?;
+        let updates: Vec<TaskUpdate> = updates
+            .iter()
+            .cloned()
+            .map(validate_task_update)
+            .collect::<Result<_, EngineError>>()?;
+        let now = Utc::now();
+        Ok(self.mutate(|doc| {
+            updates
+                .iter()
+                .map(|update| match doc.task(&update.id).ok().flatten() {
+                    Some(task) if task.board_chat_id != board_chat_id => TaskWriteResult {
+                        id: update.id.clone(),
+                        outcome: TaskWriteOutcome::OtherBoard,
+                    },
+                    Some(_) => {
+                        let outcome = match doc.update_task(update, now) {
+                            Ok(()) => TaskWriteOutcome::Updated,
+                            Err(error) => {
+                                tracing::warn!(task = %update.id, %error, "task update failed");
+                                TaskWriteOutcome::Missing
+                            }
+                        };
+                        TaskWriteResult {
+                            id: update.id.clone(),
+                            outcome,
+                        }
+                    }
+                    None => TaskWriteResult {
+                        id: update.id.clone(),
+                        outcome: task_absence(doc, &update.id),
+                    },
+                })
+                .collect()
+        }))
+    }
+
+    pub fn remove_tasks(
+        &self,
+        origin_chat_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<TaskWriteResult>, EngineError> {
+        let board_chat_id = self.task_board_id(origin_chat_id)?;
+        Ok(self.mutate(|doc| {
+            ids.iter()
+                .map(|id| {
+                    let outcome = match doc.task(id).ok().flatten() {
+                        Some(task) if task.board_chat_id != board_chat_id => {
+                            TaskWriteOutcome::OtherBoard
+                        }
+                        Some(_) => {
+                            doc.delete_task(id);
+                            TaskWriteOutcome::Deleted
+                        }
+                        None => task_absence(doc, id),
+                    };
+                    TaskWriteResult {
+                        id: id.clone(),
+                        outcome,
+                    }
+                })
+                .collect()
+        }))
+    }
+
+    fn check_task_board(&self, chat_id: &str) -> Result<(), EngineError> {
+        if self.inner.config.platform == zeron_proto::CLOUD_PLATFORM {
+            return Err(EngineError::Other(
+                "Task boards sync through the workspace registry, which a Cloud machine does not \
+                 hold; run task tools from the chat's own device"
+                    .into(),
+            ));
+        }
+        if self.parent_unknown(chat_id) {
+            return Err(EngineError::Other(
+                "This chat's parent board is not known on this device yet; retry in a moment"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn change_sidebar_pin(
         &self,
         change: &zeron_proto::SidebarPinChange,
@@ -788,6 +908,10 @@ impl WorkspaceHost {
 
     pub fn watch_sidebar_preferences(&self) -> watch::Receiver<SidebarPreferencesState> {
         self.inner.sidebar_preferences_tx.subscribe()
+    }
+
+    pub fn watch_tasks(&self) -> watch::Receiver<Vec<SessionTask>> {
+        self.inner.tasks_tx.subscribe()
     }
 
     /// Mutation acknowledgements and watches share the same ordered revision.
@@ -1462,7 +1586,7 @@ impl WorkspaceHostInner {
         // the edge refuses its writes to rows it doesn't own: reconciling here
         // would rewrite the missing preferences row after every refused push.
         let owns_sidebar = self.config.platform != zeron_proto::CLOUD_PLATFORM;
-        let snapshot = {
+        let (snapshot, tasks) = {
             let mut doc = lock(&self.reg);
             match doc.reconcile_sidebar_pins(registry_synced && owns_sidebar) {
                 Ok(true) => {
@@ -1476,8 +1600,12 @@ impl WorkspaceHostInner {
                 Err(error) => tracing::warn!(%error, "sidebar pin cleanup failed"),
             }
             self.publish_sidebar_preferences(&doc, registry_synced);
-            doc.read_all()
+            (doc.read_all(), doc.read_tasks())
         };
+        match tasks {
+            Ok(tasks) => publish_if_changed(&self.tasks_tx, tasks),
+            Err(err) => tracing::warn!(error = %err, "registry task read failed"),
+        }
         match snapshot {
             Ok(mut state) => {
                 self.overlay_presence(&mut state.devices);
@@ -1691,6 +1819,73 @@ pub(crate) fn linked_worktree_root(path: &std::path::Path) -> Option<String> {
         return None;
     }
     Some(dot_git.parent()?.to_string_lossy().into_owned())
+}
+
+fn chat_board(doc: &RegistryDoc, chat_id: &str) -> String {
+    doc.chat(chat_id)
+        .ok()
+        .flatten()
+        .and_then(|chat| chat.parent_chat_id)
+        .filter(|parent| !parent.is_empty())
+        .unwrap_or_else(|| chat_id.to_string())
+}
+
+fn task_absence(doc: &RegistryDoc, task_id: &str) -> TaskWriteOutcome {
+    if doc.task_deleted(task_id) {
+        TaskWriteOutcome::Deleted
+    } else {
+        TaskWriteOutcome::Missing
+    }
+}
+
+fn task_text(raw: &str) -> Result<String, EngineError> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return Err(EngineError::Other("A task needs text".into()));
+    }
+    if text.len() > MAX_TASK_TEXT_BYTES {
+        return Err(EngineError::Other(format!(
+            "A task's text is at most {MAX_TASK_TEXT_BYTES} bytes"
+        )));
+    }
+    Ok(text.to_string())
+}
+
+fn task_note(raw: Option<&str>) -> Result<Option<String>, EngineError> {
+    match raw.map(str::trim).filter(|note| !note.is_empty()) {
+        Some(note) if note.len() > MAX_TASK_NOTE_BYTES => Err(EngineError::Other(format!(
+            "A task's note is at most {MAX_TASK_NOTE_BYTES} bytes"
+        ))),
+        note => Ok(note.map(str::to_string)),
+    }
+}
+
+fn mint_task(
+    origin_chat_id: &str,
+    board_chat_id: &str,
+    new: &NewTask,
+    now: chrono::DateTime<Utc>,
+) -> Result<SessionTask, EngineError> {
+    let now = chrono::DateTime::from_timestamp_millis(now.timestamp_millis()).unwrap_or(now);
+    Ok(SessionTask {
+        id: crate::new_id(),
+        board_chat_id: board_chat_id.to_string(),
+        text: task_text(&new.text)?,
+        status: new.status.unwrap_or_default(),
+        owner_chat_id: new.owner_chat_id.clone(),
+        note: task_note(new.note.as_deref())?,
+        created_by: origin_chat_id.to_string(),
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+fn validate_task_update(mut update: TaskUpdate) -> Result<TaskUpdate, EngineError> {
+    update.text = update.text.as_deref().map(task_text).transpose()?;
+    if let Some(note) = &update.note {
+        update.note = Some(task_note(note.as_deref())?);
+    }
+    Ok(update)
 }
 
 /// Local live statuses win for this device's chats; every other device's rows come
@@ -2431,5 +2626,147 @@ mod tests {
         std::fs::create_dir_all(&odd).unwrap();
         std::fs::write(odd.join(".git"), "gitdir: /somewhere/else\n").unwrap();
         assert_eq!(linked_worktree_root(&odd), None);
+    }
+
+    fn task_host() -> (tempfile::TempDir, super::WorkspaceHost) {
+        use super::*;
+
+        let dir = tempfile::tempdir().unwrap();
+        let host = WorkspaceHost::open(
+            Arc::new(DocsStore::open(dir.path()).unwrap()),
+            WorkspaceHostConfig {
+                device_id: "test-device".into(),
+                device_name: "Test device".into(),
+                platform: "macos".into(),
+                org_id: "test-org".into(),
+                user_id: "test-user".into(),
+                edge: None,
+                local_only: false,
+            },
+        )
+        .unwrap();
+        (dir, host)
+    }
+
+    fn new_task(text: &str) -> zeron_proto::NewTask {
+        use zeron_proto::NewTask;
+
+        NewTask {
+            text: text.into(),
+            owner_chat_id: None,
+            status: None,
+            note: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_side_chat_writes_into_its_parents_task_board() {
+        let (_dir, host) = task_host();
+        host.create_chat_with_parent("root", None, Some("test-device"), None, None, None)
+            .unwrap();
+        host.create_chat_with_parent(
+            "side",
+            None,
+            Some("test-device"),
+            None,
+            None,
+            Some("root".into()),
+        )
+        .unwrap();
+
+        let created = host
+            .add_tasks("side", &[new_task("write the plan")])
+            .unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].board_chat_id, "root");
+        assert_eq!(created[0].created_by, "side");
+        assert_eq!(created[0].status, zeron_proto::TaskStatus::Pending);
+
+        let board = host.read_tasks("root").unwrap();
+        assert_eq!(board, created);
+        assert_eq!(host.read_tasks("side").unwrap(), created);
+
+        let mut watcher = host.watch_tasks();
+        host.inner.publish();
+        assert_eq!(watcher.borrow_and_update().clone(), created);
+
+        let mut update = zeron_proto::TaskUpdate::new(&created[0].id);
+        update.status = Some(zeron_proto::TaskStatus::Completed);
+        update.note = Some(Some("shipped".into()));
+        let results = host.update_tasks("side", &[update]).unwrap();
+        assert_eq!(results[0].outcome, zeron_proto::TaskWriteOutcome::Updated);
+        let board = host.read_tasks("root").unwrap();
+        assert_eq!(board[0].status, zeron_proto::TaskStatus::Completed);
+        assert_eq!(board[0].note.as_deref(), Some("shipped"));
+
+        let removed = host.remove_tasks("root", &[created[0].id.clone()]).unwrap();
+        assert_eq!(removed[0].outcome, zeron_proto::TaskWriteOutcome::Deleted);
+        assert!(host.read_tasks("root").unwrap().is_empty());
+        let again = host.remove_tasks("root", &[created[0].id.clone()]).unwrap();
+        assert_eq!(again[0].outcome, zeron_proto::TaskWriteOutcome::Deleted);
+        let unknown = host
+            .remove_tasks("root", &["no-such-task".to_string()])
+            .unwrap();
+        assert_eq!(unknown[0].outcome, zeron_proto::TaskWriteOutcome::Missing);
+    }
+
+    #[tokio::test]
+    async fn a_board_waiting_for_a_claimed_chats_parent_never_falls_back() {
+        let (_dir, host) = task_host();
+        host.create_chat_with_parent("root", None, Some("test-device"), None, None, None)
+            .unwrap();
+        host.add_tasks("root", &[new_task("on the root board")])
+            .unwrap();
+        host.claim_chat("claimed", Some("/tmp")).unwrap();
+
+        let error = host.read_tasks("claimed").unwrap_err().to_string();
+        assert!(error.contains("retry in a moment"), "{error}");
+        let error = host
+            .add_tasks("claimed", &[new_task("must not land")])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("retry in a moment"), "{error}");
+        assert_eq!(host.read_tasks("root").unwrap().len(), 1);
+
+        let mut chat = host.chat("claimed").unwrap().expect("the claimed row");
+        chat.parent_chat_id = Some("root".into());
+        host.mutate(|doc| doc.upsert_chat(&chat)).unwrap();
+        let board = host.read_tasks("claimed").unwrap();
+        assert_eq!(board.len(), 1);
+        assert_eq!(board[0].board_chat_id, "root");
+    }
+
+    #[tokio::test]
+    async fn a_task_of_another_board_is_refused_per_item() {
+        let (_dir, host) = task_host();
+        for chat in ["root-a", "root-b"] {
+            host.create_chat_with_parent(chat, None, Some("test-device"), None, None, None)
+                .unwrap();
+        }
+        let a = host.add_tasks("root-a", &[new_task("a")]).unwrap();
+        let b = host.add_tasks("root-b", &[new_task("b")]).unwrap();
+
+        let mut update = zeron_proto::TaskUpdate::new(&b[0].id);
+        update.status = Some(zeron_proto::TaskStatus::Completed);
+        let results = host.update_tasks("root-a", &[update]).unwrap();
+        assert_eq!(
+            results[0].outcome,
+            zeron_proto::TaskWriteOutcome::OtherBoard
+        );
+        assert_eq!(
+            host.read_tasks("root-b").unwrap()[0].status,
+            zeron_proto::TaskStatus::Pending
+        );
+
+        let results = host.remove_tasks("root-a", &[b[0].id.clone()]).unwrap();
+        assert_eq!(
+            results[0].outcome,
+            zeron_proto::TaskWriteOutcome::OtherBoard
+        );
+        assert_eq!(host.read_tasks("root-b").unwrap().len(), 1);
+        assert_eq!(host.read_tasks("root-a").unwrap(), a);
+
+        let error = host.add_tasks("root-a", &[new_task("   ")]).unwrap_err();
+        assert!(error.to_string().contains("needs text"));
     }
 }

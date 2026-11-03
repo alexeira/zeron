@@ -22,6 +22,7 @@ pub mod projectless;
 pub mod providers;
 pub mod run_errors;
 pub mod sidebar_pins;
+pub mod tasks;
 pub mod view;
 pub mod voice;
 pub mod workspace;
@@ -32,6 +33,7 @@ pub use entities::*;
 pub use preview::*;
 pub use program_status::*;
 pub use sidebar_pins::*;
+pub use tasks::*;
 pub use workspace::*;
 
 /// Parse "0.2.12" (tolerating a `-suffix`/`+build` tail on the last part)

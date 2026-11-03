@@ -17,7 +17,8 @@ use zeron_doc::{
     SessionCommandPayload, SessionMessageEntry, TranscriptFrame, apply_transcript_frame,
 };
 use zeron_proto::{
-    Chat, Device, HarnessId, Model, ReasoningLevel, Session, SessionStatus, Space, SteeringMode,
+    Chat, Device, HarnessId, Model, NewTask, ReasoningLevel, Session, SessionStatus, SessionTask,
+    Space, SteeringMode, TaskUpdate, TaskWriteResult,
 };
 use zeron_rpc::{RpcClient, RpcError, RpcSubscription, connect_ipc, methods};
 
@@ -426,6 +427,58 @@ impl Zeron {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned())
+    }
+
+    pub async fn tasks_on(&self, chat_id: &str) -> anyhow::Result<Vec<SessionTask>> {
+        let value = self
+            .call(methods::LIST_TASKS, json!({ "chatId": chat_id }))
+            .await?;
+        serde_json::from_value(value).context("ListTasks: unexpected board")
+    }
+
+    pub async fn add_tasks(
+        &self,
+        chat_id: &str,
+        tasks: &[NewTask],
+    ) -> anyhow::Result<Vec<SessionTask>> {
+        let reply = self
+            .call(
+                methods::MUTATE,
+                json!({ "op": "addTasks", "chatId": chat_id, "tasks": tasks }),
+            )
+            .await?;
+        serde_json::from_value(reply.get("tasks").cloned().unwrap_or(Value::Null))
+            .context("addTasks: unexpected reply")
+    }
+
+    pub async fn update_tasks(
+        &self,
+        chat_id: &str,
+        updates: &[TaskUpdate],
+    ) -> anyhow::Result<Vec<TaskWriteResult>> {
+        let reply = self
+            .call(
+                methods::MUTATE,
+                json!({ "op": "updateTasks", "chatId": chat_id, "updates": updates }),
+            )
+            .await?;
+        serde_json::from_value(reply.get("results").cloned().unwrap_or(Value::Null))
+            .context("updateTasks: unexpected reply")
+    }
+
+    pub async fn remove_tasks(
+        &self,
+        chat_id: &str,
+        ids: &[String],
+    ) -> anyhow::Result<Vec<TaskWriteResult>> {
+        let reply = self
+            .call(
+                methods::MUTATE,
+                json!({ "op": "removeTasks", "chatId": chat_id, "ids": ids }),
+            )
+            .await?;
+        serde_json::from_value(reply.get("results").cloned().unwrap_or(Value::Null))
+            .context("removeTasks: unexpected reply")
     }
 
     // ---- resolution --------------------------------------------------------

@@ -53,6 +53,11 @@ Delegation is one level deep: a chat that has a parent cannot create chats. \
 Pass `cloud: true` to run a child on a Cloud machine of its own (Codex or Claude Code); \
 from a Cloud chat it clones the same repository, and without `cloud` it shares your machine.\n\
 \n\
+Every chat in a session shares one task board. Read it with `list_tasks` before \
+starting delegated work; mark your task `inProgress` when you start, `blocked` with a note \
+naming what it waits for, and `completed` with a one-line note when done. An orchestrator \
+adds tasks with `add_tasks` before delegating and assigns owners by chat id, id prefix, or title.\n\
+\n\
 When a chart, table, diagram, dashboard, or 3D view would say more than prose and \
 `show_visual` is available, write a Luau visual script and show it with `show_visual` before \
 your final reply. Zeron renders it with its own native interface and enforces its style: \

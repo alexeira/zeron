@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeron_doc::SessionCommandPayload;
 use zeron_proto::{
-    AccessMode, Chat, ChatConfig, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, Session, SessionStatus,
-    Space, UserInputAnswer,
+    AccessMode, Chat, ChatConfig, HarnessId, MAX_TASKS_PER_REQUEST, NewTask, ReasoningLevel,
+    RunRequest, SandboxLevel, Session, SessionStatus, Space, TaskStatus, TaskUpdate,
+    UserInputAnswer,
 };
 
 use crate::transcript::{RenderOptions, RenderedMessage, render_entries};
@@ -198,6 +199,71 @@ fn catalog() -> Vec<ToolDef> {
             input_schema: chat_key_schema(json!({
                 "archived": { "type": "boolean", "default": true }
             })),
+        },
+        ToolDef {
+            name: "list_tasks",
+            description: "The shared task board of this session: every chat in it (this one and its side chats) reads and writes the same board. Status is pending, inProgress, blocked, or completed. Owner chats come with title, harness and model. Read the board before starting delegated work.",
+            input_schema: json!({ "type": "object", "properties": {} }),
+        },
+        ToolDef {
+            name: "add_tasks",
+            description: "Add tasks to the session board and get their ids. Owner accepts a chat id, a unique id prefix, or an exact title. The orchestrator adds tasks before delegating and assigns owners; set inProgress when you start one, completed with a one-line note when done, blocked with a note naming what it waits for.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": { "type": "string", "description": "What the task is, one line." },
+                                "owner": { "type": "string", "description": "Chat id, unique id prefix, or exact title of the chat that does it." },
+                                "status": { "type": "string", "enum": ["pending", "inProgress", "blocked", "completed"], "default": "pending" },
+                                "note": { "type": "string", "description": "One-line detail: what it waits for, or what was done." }
+                            },
+                            "required": ["text"]
+                        }
+                    }
+                },
+                "required": ["tasks"]
+            }),
+        },
+        ToolDef {
+            name: "update_tasks",
+            description: "Edit tasks on the session board. Send only the fields that change; absent fields keep their value, and owner: null or note: null clears them. Reports each id as updated, deleted (already removed), missing, or otherBoard.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "updates": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "text": { "type": "string" },
+                                "status": { "type": "string", "enum": ["pending", "inProgress", "blocked", "completed"] },
+                                "owner": { "type": ["string", "null"], "description": "Chat id, unique id prefix, or exact title; null unassigns." },
+                                "note": { "type": ["string", "null"], "description": "One-line detail; null clears it." }
+                            },
+                            "required": ["id"]
+                        }
+                    }
+                },
+                "required": ["updates"]
+            }),
+        },
+        ToolDef {
+            name: "remove_tasks",
+            description: "Remove tasks from the session board by id. Reports each id as deleted, missing, or otherBoard.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "ids": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+                },
+                "required": ["ids"]
+            }),
         },
     ];
     for (name, single, description) in [
@@ -645,6 +711,46 @@ struct AnswerArg {
     labels: Vec<String>,
 }
 
+#[derive(Deserialize)]
+struct AddTasksArgs {
+    tasks: Vec<NewTaskArg>,
+}
+
+#[derive(Deserialize)]
+struct NewTaskArg {
+    text: String,
+    owner: Option<String>,
+    status: Option<String>,
+    note: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UpdateTasksArgs {
+    updates: Vec<TaskUpdateArg>,
+}
+
+#[derive(Deserialize)]
+struct TaskUpdateArg {
+    id: String,
+    text: Option<String>,
+    status: Option<String>,
+    #[serde(default, deserialize_with = "zeron_proto::present_optional")]
+    owner: Option<Option<String>>,
+    #[serde(default, deserialize_with = "zeron_proto::present_optional")]
+    note: Option<Option<String>>,
+}
+
+#[derive(Deserialize)]
+struct RemoveTasksArgs {
+    ids: Vec<String>,
+}
+
+fn task_status_arg(raw: &str) -> anyhow::Result<TaskStatus> {
+    TaskStatus::parse(raw).with_context(|| {
+        format!("status {raw:?} is not one of pending, inProgress, blocked, completed")
+    })
+}
+
 fn parse<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, String> {
     serde_json::from_value(args).map_err(|e| format!("invalid arguments: {e}"))
 }
@@ -774,6 +880,10 @@ impl Tools {
             "interrupt_chat" => self.interrupt_chat(parse(args)?).await,
             "respond_to_input" => self.respond_to_input(parse(args)?).await,
             "archive_chat" => self.archive_chat(parse(args)?).await,
+            "list_tasks" => self.list_tasks().await,
+            "add_tasks" => self.add_tasks(parse(args)?).await,
+            "update_tasks" => self.update_tasks(parse(args)?).await,
+            "remove_tasks" => self.remove_tasks(parse(args)?).await,
             SHOW_VISUAL => self.show_visual(parse(args)?).await,
             SHOW_IMAGE => self.show_image(parse(args)?).await,
             other => return Err(format!("unknown tool: {other}")),
@@ -1367,6 +1477,114 @@ impl Tools {
         Ok(json!({ "chatId": chat.id, "title": chat.title, "archived": archived }))
     }
 
+    fn board_chat(&self) -> anyhow::Result<String> {
+        self.zeron
+            .origin()
+            .chat_id
+            .clone()
+            .context("Task boards belong to a chat, and this MCP server was not started inside one")
+    }
+
+    async fn list_tasks(&self) -> anyhow::Result<Value> {
+        let chat_id = self.board_chat()?;
+        let (tasks, chats) = tokio::try_join!(self.zeron.tasks_on(&chat_id), self.zeron.chats())?;
+        let rows: Vec<Value> = tasks
+            .iter()
+            .map(|task| {
+                let owner = task
+                    .owner_chat_id
+                    .as_deref()
+                    .and_then(|id| chats.iter().find(|chat| chat.id == id));
+                json!({
+                    "id": task.id,
+                    "boardChatId": task.board_chat_id,
+                    "text": task.text,
+                    "status": task.status,
+                    "ownerChatId": task.owner_chat_id,
+                    "ownerTitle": owner.and_then(|chat| chat.title.clone()),
+                    "ownerHarness": owner.and_then(|chat| chat.config.as_ref()).map(|config| config.harness),
+                    "ownerModel": owner.and_then(|chat| chat.config.as_ref()).and_then(|config| config.model.clone()),
+                    "note": task.note,
+                    "createdBy": task.created_by,
+                    "createdAt": task.created_at,
+                    "updatedAt": task.updated_at,
+                })
+            })
+            .collect();
+        Ok(json!({ "total": rows.len(), "tasks": rows }))
+    }
+
+    async fn add_tasks(&self, args: AddTasksArgs) -> anyhow::Result<Value> {
+        let chat_id = self.board_chat()?;
+        anyhow::ensure!(!args.tasks.is_empty(), "tasks is empty");
+        anyhow::ensure!(
+            args.tasks.len() <= MAX_TASKS_PER_REQUEST,
+            "at most {MAX_TASKS_PER_REQUEST} tasks per request"
+        );
+        let mut tasks = Vec::with_capacity(args.tasks.len());
+        for task in args.tasks {
+            let owner_chat_id = match task.owner.as_deref().map(str::trim) {
+                Some(key) if !key.is_empty() => Some(self.zeron.resolve_chat(key).await?.id),
+                _ => None,
+            };
+            let status = match task.status.as_deref().map(str::trim) {
+                Some(raw) if !raw.is_empty() => Some(task_status_arg(raw)?),
+                _ => None,
+            };
+            tasks.push(NewTask {
+                text: task.text,
+                owner_chat_id,
+                status,
+                note: task.note,
+            });
+        }
+        let created = self.zeron.add_tasks(&chat_id, &tasks).await?;
+        Ok(json!({ "tasks": created }))
+    }
+
+    async fn update_tasks(&self, args: UpdateTasksArgs) -> anyhow::Result<Value> {
+        let chat_id = self.board_chat()?;
+        anyhow::ensure!(!args.updates.is_empty(), "updates is empty");
+        anyhow::ensure!(
+            args.updates.len() <= MAX_TASKS_PER_REQUEST,
+            "at most {MAX_TASKS_PER_REQUEST} updates per request"
+        );
+        let mut updates = Vec::with_capacity(args.updates.len());
+        for update in args.updates {
+            let mut parsed = TaskUpdate::new(update.id.trim());
+            parsed.text = update.text;
+            parsed.status = match update.status.as_deref().map(str::trim) {
+                Some(raw) if !raw.is_empty() => Some(task_status_arg(raw)?),
+                _ => None,
+            };
+            parsed.owner_chat_id = match update.owner {
+                Some(Some(key)) if !key.trim().is_empty() => {
+                    Some(Some(self.zeron.resolve_chat(key.trim()).await?.id))
+                }
+                Some(Some(_)) => Some(None),
+                Some(None) => Some(None),
+                None => None,
+            };
+            parsed.note = update.note;
+            updates.push(parsed);
+        }
+        let results = self.zeron.update_tasks(&chat_id, &updates).await?;
+        Ok(json!({ "results": results }))
+    }
+
+    async fn remove_tasks(&self, args: RemoveTasksArgs) -> anyhow::Result<Value> {
+        let chat_id = self.board_chat()?;
+        anyhow::ensure!(!args.ids.is_empty(), "ids is empty");
+        let ids: Vec<String> = args
+            .ids
+            .into_iter()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect();
+        let results = self.zeron.remove_tasks(&chat_id, &ids).await?;
+        Ok(json!({ "results": results }))
+    }
+
     async fn show_visual(&self, args: ShowVisualArgs) -> anyhow::Result<Value> {
         let chat_id = self
             .zeron
@@ -1758,7 +1976,10 @@ mod tests {
         async fn handle(&self, method: &str, params: Value) -> Result<RpcReply, RpcError> {
             if matches!(
                 method,
-                methods::LIST_HARNESSES | methods::LIST_MODELS | methods::LIST_AGENT_ACCOUNTS
+                methods::LIST_HARNESSES
+                    | methods::LIST_MODELS
+                    | methods::LIST_AGENT_ACCOUNTS
+                    | methods::LIST_TASKS
             ) {
                 self.reads
                     .lock()
@@ -1865,6 +2086,71 @@ mod tests {
                         .unwrap()
                         .push((method.to_owned(), params.clone()));
                     RpcReply::Value(json!({ "id": "img:1", "name": params["name"] }))
+                }
+                methods::LIST_TASKS => RpcReply::Value(json!([
+                    {
+                        "id": "task-1", "boardChatId": params["chatId"], "text": "plan the work",
+                        "status": "inProgress", "ownerChatId": "chat-beta-2", "note": null,
+                        "createdBy": "chat-alpha-1", "createdAt": 1000, "updatedAt": 2000
+                    },
+                    {
+                        "id": "task-2", "boardChatId": params["chatId"], "text": "review the work",
+                        "status": "pending", "ownerChatId": "chat-alpha-1",
+                        "createdBy": "chat-alpha-1", "createdAt": 3000, "updatedAt": 3000
+                    }
+                ])),
+                methods::MUTATE if params["op"] == "addTasks" => {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    let tasks: Vec<Value> = params["tasks"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .iter()
+                        .enumerate()
+                        .map(|(index, task)| {
+                            json!({
+                                "id": format!("task-new-{index}"),
+                                "boardChatId": "chat-alpha-1",
+                                "text": task["text"],
+                                "status": task["status"].as_str().unwrap_or("pending"),
+                                "ownerChatId": task["ownerChatId"],
+                                "createdBy": params["chatId"],
+                                "createdAt": 1000, "updatedAt": 1000,
+                            })
+                        })
+                        .collect();
+                    RpcReply::Value(json!({ "ok": true, "tasks": tasks }))
+                }
+                methods::MUTATE if params["op"] == "updateTasks" => {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    let results: Vec<Value> = params["updates"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|update| json!({ "id": update["id"], "outcome": "updated" }))
+                        .collect();
+                    RpcReply::Value(json!({ "ok": true, "results": results }))
+                }
+                methods::MUTATE if params["op"] == "removeTasks" => {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    let results: Vec<Value> = params["ids"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|id| json!({ "id": id, "outcome": "deleted" }))
+                        .collect();
+                    RpcReply::Value(json!({ "ok": true, "results": results }))
                 }
                 methods::MUTATE | methods::QUEUE_COMMAND | methods::QUEUE_MESSAGE => {
                     // A Cloud chat gets a machine of its own from the engine.
@@ -3248,5 +3534,118 @@ mod tests {
             whoami["result"]["structuredContent"]["localDeviceId"],
             "dev-local"
         );
+    }
+
+    #[tokio::test]
+    async fn task_tools_read_the_board_and_write_against_the_calling_chat() {
+        let world = Arc::new(World::default());
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                ..Default::default()
+            },
+        );
+
+        let listed = tools.call("list_tasks", json!({})).await.unwrap();
+        assert_eq!(listed["total"], 2);
+        assert_eq!(listed["tasks"][0]["boardChatId"], "chat-alpha-1");
+        assert_eq!(listed["tasks"][0]["status"], "inProgress");
+        assert_eq!(listed["tasks"][0]["ownerTitle"], "Beta");
+        assert_eq!(listed["tasks"][1]["ownerTitle"], "Alpha");
+        assert_eq!(listed["tasks"][1]["ownerHarness"], "claude-code");
+        assert_eq!(listed["tasks"][1]["ownerModel"], "opus");
+        assert_eq!(
+            world.reads.lock().unwrap().last().unwrap().1["chatId"],
+            "chat-alpha-1"
+        );
+
+        let added = tools
+            .call(
+                "add_tasks",
+                json!({ "tasks": [{
+                    "text": "ship it", "owner": "Beta", "status": "in_progress"
+                }] }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(added["tasks"][0]["id"], "task-new-0");
+        assert_eq!(added["tasks"][0]["status"], "inProgress");
+        let write = world.writes.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(write.1["op"], "addTasks");
+        assert_eq!(write.1["chatId"], "chat-alpha-1");
+        assert_eq!(write.1["tasks"][0]["ownerChatId"], "chat-beta-2");
+        assert_eq!(write.1["tasks"][0]["status"], "inProgress");
+
+        let updated = tools
+            .call(
+                "update_tasks",
+                json!({ "updates": [{
+                    "id": "task-new-0", "status": "completed", "owner": null
+                }] }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated["results"][0]["outcome"], "updated");
+        let write = world.writes.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(write.1["op"], "updateTasks");
+        assert_eq!(write.1["updates"][0]["status"], "completed");
+        assert!(
+            write.1["updates"][0]
+                .get("ownerChatId")
+                .is_some_and(Value::is_null),
+            "{}",
+            write.1
+        );
+
+        let removed = tools
+            .call("remove_tasks", json!({ "ids": ["task-new-0"] }))
+            .await
+            .unwrap();
+        assert_eq!(removed["results"][0]["outcome"], "deleted");
+        assert_eq!(
+            world.writes.lock().unwrap().last().unwrap().1["op"],
+            "removeTasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_tools_need_a_chat_and_validate_before_writing() {
+        let world = Arc::new(World::default());
+        let outside = tools(world.clone(), Origin::default());
+        let error = outside.call("list_tasks", json!({})).await.unwrap_err();
+        assert!(error.contains("not started inside one"), "{error}");
+
+        let inside = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                ..Default::default()
+            },
+        );
+        let error = inside
+            .call(
+                "add_tasks",
+                json!({ "tasks": [{ "text": "x", "status": "someday" }] }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("pending, inProgress, blocked, completed"),
+            "{error}"
+        );
+        assert!(
+            inside
+                .call("add_tasks", json!({ "tasks": [] }))
+                .await
+                .is_err()
+        );
+        assert!(
+            inside
+                .call("update_tasks", json!({ "updates": [] }))
+                .await
+                .is_err()
+        );
+        assert!(world.writes.lock().unwrap().is_empty());
     }
 }

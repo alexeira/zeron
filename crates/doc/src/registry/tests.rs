@@ -4,7 +4,7 @@
 //! tested, not asserted.
 
 use super::*;
-use zeron_proto::{HarnessId, SandboxLevel, SessionStatus};
+use zeron_proto::{HarnessId, SandboxLevel, SessionStatus, SessionTask, TaskStatus, TaskUpdate};
 
 fn ts(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::UNIX_EPOCH)
@@ -2402,4 +2402,118 @@ fn a_deleted_device_row_reads_as_deleted_not_unknown() {
     back.last_seen_at = Some(ts(9_000));
     ws.upsert_device(&back).unwrap();
     assert!(!ws.device_deleted("cloud-1"));
+}
+
+fn task(id: &str, board: &str, at: i64) -> SessionTask {
+    SessionTask {
+        id: id.into(),
+        board_chat_id: board.into(),
+        text: format!("task {id}"),
+        status: TaskStatus::Pending,
+        owner_chat_id: None,
+        note: None,
+        created_by: board.into(),
+        created_at: ts(at),
+        updated_at: ts(at),
+    }
+}
+
+#[test]
+fn a_task_board_reads_back_the_tasks_it_holds() {
+    let mut ws = RegistryDoc::new("dev-a");
+    ws.upsert_task(&task("t2", "root", 2_000)).unwrap();
+    ws.upsert_task(&task("t1", "root", 1_000)).unwrap();
+    ws.upsert_task(&task("t3", "other-root", 3_000)).unwrap();
+
+    let board: Vec<String> = ws
+        .task_board("root")
+        .unwrap()
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    assert_eq!(board, ["t1", "t2"]);
+    assert_eq!(ws.read_tasks().unwrap().len(), 3);
+    assert_eq!(ws.task("t3").unwrap().unwrap().board_chat_id, "other-root");
+    assert!(ws.task("never-heard-of").unwrap().is_none());
+}
+
+#[test]
+fn an_update_writes_only_the_fields_it_names() {
+    let mut ws = RegistryDoc::new("dev-a");
+    let mut created = task("t1", "root", 1_000);
+    created.owner_chat_id = Some("worker".into());
+    created.note = Some("started".into());
+    ws.upsert_task(&created).unwrap();
+
+    let mut update = TaskUpdate::new("t1");
+    update.status = Some(TaskStatus::InProgress);
+    ws.update_task(&update, ts(2_000)).unwrap();
+
+    let task = ws.task("t1").unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::InProgress);
+    assert_eq!(task.text, "task t1");
+    assert_eq!(task.owner_chat_id.as_deref(), Some("worker"));
+    assert_eq!(task.note.as_deref(), Some("started"));
+    assert_eq!(task.updated_at, ts(2_000));
+    assert_eq!(task.created_at, ts(1_000));
+
+    let mut clear = TaskUpdate::new("t1");
+    clear.owner_chat_id = Some(None);
+    ws.update_task(&clear, ts(3_000)).unwrap();
+    let task = ws.task("t1").unwrap().unwrap();
+    assert!(task.owner_chat_id.is_none());
+    assert_eq!(task.note.as_deref(), Some("started"));
+}
+
+#[test]
+fn two_writers_updating_different_fields_both_survive() {
+    let mut ws = RegistryDoc::new("dev-a");
+    ws.upsert_task(&task("t1", "root", 1_000)).unwrap();
+    let mut status = TaskUpdate::new("t1");
+    status.status = Some(TaskStatus::Completed);
+    ws.update_task(&status, ts(2_000)).unwrap();
+    let mut note = TaskUpdate::new("t1");
+    note.note = Some(Some("shipped".into()));
+    ws.update_task(&note, ts(3_000)).unwrap();
+
+    let task = ws.task("t1").unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Completed);
+    assert_eq!(task.note.as_deref(), Some("shipped"));
+    let row = ws.overlay_row(KIND_TASKS, "t1").unwrap();
+    assert!(row.clocks.contains_key("status"));
+    assert!(row.clocks.contains_key("note"));
+}
+
+#[test]
+fn an_update_never_creates_or_revives_a_task() {
+    let mut ws = RegistryDoc::new("dev-a");
+    let mut update = TaskUpdate::new("missing");
+    update.status = Some(TaskStatus::Completed);
+    ws.update_task(&update, ts(1_000)).unwrap();
+    assert!(ws.task("missing").unwrap().is_none());
+    assert!(!ws.task_exists("missing"));
+
+    ws.upsert_task(&task("t1", "root", 1_000)).unwrap();
+    assert!(ws.delete_task("t1"));
+    assert!(ws.task_deleted("t1"));
+    assert!(ws.task_board("root").unwrap().is_empty());
+
+    let mut late = TaskUpdate::new("t1");
+    late.status = Some(TaskStatus::Completed);
+    ws.update_task(&late, ts(9_000)).unwrap();
+    assert!(ws.task_deleted("t1"));
+    assert!(ws.task("t1").unwrap().is_none());
+    assert!(!ws.delete_task("t1"));
+}
+
+#[test]
+fn a_recreated_task_id_revives_with_its_own_fields() {
+    let mut ws = RegistryDoc::new("dev-a");
+    ws.upsert_task(&task("t1", "root", 1_000)).unwrap();
+    ws.delete_task("t1");
+    ws.upsert_task(&task("t1", "root", 5_000)).unwrap();
+    assert!(!ws.task_deleted("t1"));
+    let task = ws.task("t1").unwrap().unwrap();
+    assert_eq!(task.text, "task t1");
+    assert_eq!(task.created_at, ts(5_000));
 }

@@ -656,6 +656,12 @@ struct FetchToolBlobParams {
     blob_ref: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TasksBoardParams {
+    chat_id: String,
+}
+
 /// Where a Cloud chat runs: its session device and that machine's checkout.
 struct CloudHost {
     device_id: String,
@@ -777,6 +783,18 @@ enum MutateParams {
         #[serde(default)]
         at: Option<i64>,
     },
+    #[serde(rename_all = "camelCase")]
+    AddTasks {
+        chat_id: String,
+        tasks: Vec<zeron_proto::NewTask>,
+    },
+    #[serde(rename_all = "camelCase")]
+    UpdateTasks {
+        chat_id: String,
+        updates: Vec<zeron_proto::TaskUpdate>,
+    },
+    #[serde(rename_all = "camelCase")]
+    RemoveTasks { chat_id: String, ids: Vec<String> },
 }
 
 #[derive(Clone)]
@@ -1768,9 +1786,24 @@ impl EngineRpc {
             .ok_or(VoiceRejection::Unsupported)
     }
 
-    fn mutate(&self, params: MutateParams) -> Result<(), RpcError> {
+    fn mutate(&self, params: MutateParams) -> Result<Option<serde_json::Value>, RpcError> {
         let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
         match params {
+            MutateParams::AddTasks { chat_id, tasks } => {
+                let created = self.workspace.add_tasks(&chat_id, &tasks).map_err(failed)?;
+                return Ok(Some(serde_json::json!({ "ok": true, "tasks": created })));
+            }
+            MutateParams::UpdateTasks { chat_id, updates } => {
+                let results = self
+                    .workspace
+                    .update_tasks(&chat_id, &updates)
+                    .map_err(failed)?;
+                return Ok(Some(serde_json::json!({ "ok": true, "results": results })));
+            }
+            MutateParams::RemoveTasks { chat_id, ids } => {
+                let results = self.workspace.remove_tasks(&chat_id, &ids).map_err(failed)?;
+                return Ok(Some(serde_json::json!({ "ok": true, "results": results })));
+            }
             MutateParams::CreateChat {
                 chat_id,
                 space_id,
@@ -1997,6 +2030,7 @@ impl EngineRpc {
                     .map(drop)
             }
         }
+        .map(|()| None)
     }
 }
 
@@ -3297,6 +3331,42 @@ impl RpcService for EngineRpc {
             methods::WATCH_SPACES => Ok(RpcReply::Stream(watch_stream(
                 self.workspace.watch_spaces(),
             ))),
+            methods::LIST_TASKS => {
+                let p: TasksBoardParams = parse_params(params)?;
+                let tasks = self
+                    .workspace
+                    .read_tasks(&p.chat_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&tasks)
+            }
+            methods::WATCH_TASKS => {
+                let p: TasksBoardParams = parse_params(params)?;
+                let board_chat_id = self
+                    .workspace
+                    .task_board_id(&p.chat_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let stream = futures::stream::unfold(
+                    (self.workspace.watch_tasks(), board_chat_id, false),
+                    |(mut tasks, board_chat_id, emitted)| async move {
+                        if emitted {
+                            tasks.changed().await.ok()?;
+                        }
+                        let board: Vec<zeron_proto::SessionTask> = {
+                            let published = tasks.borrow_and_update();
+                            published
+                                .iter()
+                                .filter(|task| task.board_chat_id == board_chat_id)
+                                .cloned()
+                                .collect()
+                        };
+                        Some((
+                            serde_json::to_value(board).ok()?,
+                            (tasks, board_chat_id, true),
+                        ))
+                    },
+                );
+                Ok(RpcReply::Stream(Box::pin(stream)))
+            }
             methods::WATCH_SESSIONS => {
                 // Local live statuses merged with remote devices' workspace rows.
                 let merged = self
@@ -3462,13 +3532,16 @@ impl RpcService for EngineRpc {
                     }));
                 }
                 let sidebar_pins = matches!(&p, MutateParams::ChangeSidebarPin { .. });
-                self.mutate(p)?;
+                let detail = self.mutate(p)?;
                 if sidebar_pins {
                     return RpcReply::value(&serde_json::json!({
                         "ok": true, "sidebarPreferences": self.workspace.sidebar_preferences_snapshot(),
                     }));
                 }
-                RpcReply::value(&serde_json::json!({ "ok": true }))
+                match detail {
+                    Some(detail) => RpcReply::value(&detail),
+                    None => RpcReply::value(&serde_json::json!({ "ok": true })),
+                }
             }
             methods::WATCH_CHECKOUT_DIFFS => {
                 Ok(RpcReply::Stream(watch_stream(self.diff_sync.watch_diffs())))
