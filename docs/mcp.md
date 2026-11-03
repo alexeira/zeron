@@ -171,12 +171,34 @@ name (default: the local engine's device).
 | `interrupt_chat`   | `QueueCommand` Interrupt                                  |
 | `respond_to_input` | `QueueCommand` RespondInput                               |
 | `archive_chat`     | `Mutate setChatArchived`                                  |
+| `list_tasks`       | `ListTasks {chatId}` — the session board of this chat     |
+| `add_tasks`        | `Mutate addTasks {chatId, tasks}`                        |
+| `update_tasks`     | `Mutate updateTasks {chatId, updates}`                   |
+| `remove_tasks`     | `Mutate removeTasks {chatId, ids}`                       |
 | `show_visual`      | `PublishVisual {chatId, title, script, assets}` (origin chat only; assets base64 by name, read by the MCP server from the agent's cwd) |
 | `show_image`       | `PublishImage {chatId, name, data}` (origin chat only; the file base64, read by the MCP server from the agent's cwd) |
 
 Watch streams are the engine's only read surface (there is no one-shot "get
 transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop
-cancels server-side, exactly what the sidebar does on attach.
+cancels server-side, exactly what the sidebar does on attach. `list_tasks` is
+the one exception: `ListTasks` answers from the workspace registry under its
+lock, so a model that writes a task and lists the board right after sees its
+own write.
+
+Every chat in a session shares one task board: the board of its root
+(orchestrating) chat. A side chat writes into its parent's board; a chat with
+no parent owns its board. Any chat in the session may create, reassign, edit
+and close any task, and the board syncs through the registry `tasks` rows
+([registry sync](registry-sync.md)), so the desktop's task tab and every other
+device see the same list. Owners are chats: `add_tasks` and `update_tasks` take a
+chat id, a unique id prefix, or an exact title, and `list_tasks` reports each
+owner's title, harness and model when the chat is known. Statuses are
+`pending`, `inProgress`, `blocked` and `completed`; a blocked task carries a
+note naming what it waits for. Writes report per item: `updated`, `deleted`
+(the task was already removed), `missing`, or `otherBoard`.
+
+Task rows are hosted kinds: a Cloud machine neither reads nor writes them, so
+the tools fail there with a message to run them from the chat's own device.
 
 `send_message` mode `auto` starts idle chats and steers working chats through
 their live mailbox without interrupting tools or child processes. Providers

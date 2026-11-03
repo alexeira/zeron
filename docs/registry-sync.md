@@ -138,6 +138,21 @@ share the UI's ordered optimistic queue; a rejected write reveals the latest
 confirmed state. Later pin toggles from older apps still take effect through their
 existing `pinned` field clocks. Section syncing itself requires an updated app.
 
+## Task boards
+
+A session's shared task board is a set of `tasks` rows in the same per-user
+registry: one row per task, keyed by a UUID, with `boardChatId`, `text`,
+`status` (`pending`/`inProgress`/`blocked`/`completed`), `ownerChatId`,
+`note`, `createdBy`, `createdAt` and `updatedAt`. The board is the root chat's:
+a side chat writes into its parent's board, and the engine resolves that (never
+the tools), waiting for a claimed chat's `createChat` instead of guessing.
+Creating a task is one `upsert` with every field; an edit is an `update`
+carrying only the fields it changes (per-field LWW keeps concurrent edits of
+different fields), and removing a task is a tombstone. `ListTasks` answers from
+the local replica under the registry lock; `WatchTasks` streams one board to
+the UI. Tasks are hosted kinds, so a Cloud runner neither reads nor writes
+them.
+
 Legacy per-profile UI sections import after an authoritative registry snapshot.
 Import skips existing section IDs (including deleted ones) and existing explicit
 placements, so replay does not overwrite newer edits. The engine persists the
