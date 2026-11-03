@@ -374,6 +374,8 @@ fn demo_accounts() -> AgentAccountsSnapshot {
         label: label.into(),
         used_fraction: used,
         resets_at: Some(chrono::Utc::now() + chrono::Duration::hours(hours)),
+        title: None,
+        amount: None,
     };
     let account = |id: &str, harness: HarnessId, email: &str, plan: &str| AgentAccount {
         id: id.into(),

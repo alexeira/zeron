@@ -1480,6 +1480,18 @@ pub struct AgentUsageWindow {
     /// 0.0..=1.0
     pub used_fraction: f32,
     pub resets_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<UsageAmount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageAmount {
+    pub used: f64,
+    pub limit: f64,
+    pub unit: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2135,6 +2147,42 @@ mod mutation_contract_tests {
         assert!(
             serde_json::from_value::<WorkspaceMutationRejection>(serde_json::json!("overwrite"))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_usage_window_json_without_title_or_amount_decodes() {
+        let window: AgentUsageWindow = serde_json::from_value(serde_json::json!({
+            "label": "Session",
+            "usedFraction": 0.5,
+            "resetsAt": null
+        }))
+        .unwrap();
+        assert_eq!(window.title, None);
+        assert_eq!(window.amount, None);
+    }
+
+    #[test]
+    fn usage_window_title_and_amount_round_trip() {
+        let window = AgentUsageWindow {
+            label: "DeepSeek".into(),
+            used_fraction: 0.25,
+            resets_at: None,
+            title: Some("DeepSeek V4 Flash".into()),
+            amount: Some(UsageAmount {
+                used: 6463146.0,
+                limit: 1_000_000_000.0,
+                unit: "tokens".into(),
+            }),
+        };
+        let encoded = serde_json::to_value(&window).unwrap();
+        assert_eq!(encoded["title"], "DeepSeek V4 Flash");
+        assert_eq!(encoded["amount"]["used"], 6463146.0);
+        assert_eq!(encoded["amount"]["limit"], 1_000_000_000.0);
+        assert_eq!(encoded["amount"]["unit"], "tokens");
+        assert_eq!(
+            serde_json::from_value::<AgentUsageWindow>(encoded).unwrap(),
+            window
         );
     }
 }

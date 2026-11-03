@@ -1212,6 +1212,20 @@ fn nan_usage_reads_each_models_share_of_its_cap() {
     let snapshot = nan_usage_snapshot(&body).unwrap();
     let labels: Vec<_> = snapshot.windows.iter().map(|w| w.label.as_str()).collect();
     assert_eq!(labels, ["DeepSeek", "GLM"]);
+    let titles: Vec<_> = snapshot
+        .windows
+        .iter()
+        .map(|w| w.title.as_deref().unwrap())
+        .collect();
+    assert_eq!(titles, ["DeepSeek V4 Flash", "GLM 5.3 Flash"]);
+    assert_eq!(
+        snapshot.windows[0].amount,
+        Some(zeron_proto::UsageAmount {
+            used: 250000000.0,
+            limit: 1000000000.0,
+            unit: "tokens".into(),
+        })
+    );
     assert!((snapshot.windows[0].used_fraction - 0.25).abs() < 1e-6);
     assert!((snapshot.windows[1].used_fraction - 0.1).abs() < 1e-6);
     assert_eq!(
@@ -1254,6 +1268,16 @@ fn nan_usage_reads_each_models_share_of_its_cap() {
             .is_empty()
     );
     assert!(nan_usage_snapshot(&serde_json::json!({ "error": "invalid session" })).is_none());
+}
+
+#[test]
+fn nan_model_title_names_the_family_and_variant() {
+    assert_eq!(nan_model_title("deepseek-v4-flash"), "DeepSeek V4 Flash");
+    assert_eq!(nan_model_title("glm5.3-flash"), "GLM 5.3 Flash");
+    assert_eq!(nan_model_title("glm5.3"), "GLM 5.3");
+    assert_eq!(nan_model_title("qwen3.8-flash"), "Qwen 3.8 Flash");
+    assert_eq!(nan_model_title("mimo-v2.6-flash"), "MiMo V2.6 Flash");
+    assert_eq!(nan_model_title("unknown-model"), "unknown-model");
 }
 
 #[test]

@@ -91,11 +91,15 @@ impl MuseUsage {
                 .to_string(),
                 used_fraction: fraction(self.window.used_percent),
                 resets_at: resets(self.window.resets_at_ms),
+                title: None,
+                amount: None,
             },
             zeron_proto::AgentUsageWindow {
                 label: "Week".into(),
                 used_fraction: fraction(self.weekly.used_percent),
                 resets_at: resets(self.weekly.resets_at_ms),
+                title: None,
+                amount: None,
             },
         ]
     }

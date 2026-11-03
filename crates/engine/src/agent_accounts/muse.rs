@@ -639,6 +639,8 @@ for line in sys.stdin:
             label: label.into(),
             used_fraction: 0.25,
             resets_at: None,
+            title: None,
+            amount: None,
         };
         env.record_usage(
             HarnessId::Muse,

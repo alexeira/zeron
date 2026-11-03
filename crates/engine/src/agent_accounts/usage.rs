@@ -386,6 +386,12 @@ pub(super) fn nan_usage_snapshot(body: &serde_json::Value) -> Option<UsageSnapsh
                 label: nan_model_label(&id, &ids),
                 used_fraction: (used / cap).clamp(0.0, 1.0) as f32,
                 resets_at: parse_when(model.get("periodEnd")),
+                title: Some(nan_model_title(&id)),
+                amount: Some(UsageAmount {
+                    used,
+                    limit: cap,
+                    unit: "tokens".into(),
+                }),
             })
         })
         .collect();
@@ -401,16 +407,42 @@ fn nan_model_family(id: &str) -> &str {
         .unwrap_or(id)
 }
 
-fn nan_model_label(id: &str, ids: &[String]) -> String {
-    let family = nan_model_family(id);
-    let name = match family {
+fn nan_family_name(family: &str) -> Option<&'static str> {
+    Some(match family {
         "deepseek" => "DeepSeek",
         "glm" => "GLM",
         "qwen" => "Qwen",
         "mimo" => "MiMo",
         "gemma" => "Gemma",
         "minimax" => "MiniMax",
-        _ => return id.to_string(),
+        _ => return None,
+    })
+}
+
+pub(super) fn nan_model_title(id: &str) -> String {
+    let family = nan_model_family(id);
+    let Some(name) = nan_family_name(family) else {
+        return id.to_string();
+    };
+    let mut title = name.to_string();
+    for segment in id[family.len()..]
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+    {
+        title.push(' ');
+        let mut chars = segment.chars();
+        if let Some(first) = chars.next() {
+            title.extend(first.to_uppercase());
+            title.push_str(chars.as_str());
+        }
+    }
+    title
+}
+
+fn nan_model_label(id: &str, ids: &[String]) -> String {
+    let family = nan_model_family(id);
+    let Some(name) = nan_family_name(family) else {
+        return id.to_string();
     };
     let siblings: Vec<&String> = ids
         .iter()
@@ -459,6 +491,8 @@ pub(super) fn grok_usage_snapshot(body: &serde_json::Value) -> Option<UsageSnaps
                     .and_then(|p| p.get("end"))
                     .or_else(|| config.get("billingPeriodEnd")),
             ),
+            title: None,
+            amount: None,
         }],
         plan_label: None,
     })
@@ -497,6 +531,8 @@ pub(super) fn devin_usage_snapshot(
                     label: label.to_string(),
                     used_fraction: ((100.0 - remaining) / 100.0).clamp(0.0, 1.0) as f32,
                     resets_at: json_secs(plan.get(reset_key)),
+                    title: None,
+                    amount: None,
                 });
             }
         }
@@ -583,6 +619,8 @@ pub(super) fn copilot_usage_snapshot(body: &serde_json::Value) -> Option<UsageSn
                 label: label.to_string(),
                 used_fraction: used.clamp(0.0, 1.0) as f32,
                 resets_at,
+                title: None,
+                amount: None,
             });
         }
     } else if let (Some(monthly), Some(left)) = (
@@ -599,6 +637,8 @@ pub(super) fn copilot_usage_snapshot(body: &serde_json::Value) -> Option<UsageSn
                     label: label.to_string(),
                     used_fraction: (1.0 - remaining / total).clamp(0.0, 1.0) as f32,
                     resets_at,
+                    title: None,
+                    amount: None,
                 });
             }
         }
@@ -647,6 +687,8 @@ pub(super) fn nous_usage_snapshot(body: &serde_json::Value) -> Option<UsageSnaps
             label: "Month".to_string(),
             used_fraction: (1.0 - remaining / monthly).clamp(0.0, 1.0) as f32,
             resets_at: parse_when(sub.get("current_period_end")),
+            title: None,
+            amount: None,
         });
     }
     (body.get("user").is_some() || subscription.is_some()).then_some(UsageSnapshot {

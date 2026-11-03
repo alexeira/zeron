@@ -33,6 +33,8 @@ pub fn claude(body: &serde_json::Value) -> Option<Vec<AgentUsageWindow>> {
                 label: label.to_string(),
                 used_fraction: (utilization / 100.0) as f32,
                 resets_at: parse_when(w.get("resets_at")),
+                title: None,
+                amount: None,
             });
         }
     }
@@ -56,6 +58,8 @@ pub fn codex(body: &serde_json::Value) -> Option<(Vec<AgentUsageWindow>, Option<
                 label: codex_window_label(span).to_string(),
                 used_fraction: (used / 100.0) as f32,
                 resets_at: parse_when(w.get("reset_at")),
+                title: None,
+                amount: None,
             });
         }
     }

@@ -536,6 +536,8 @@ mod tests {
                     label: "5h".into(),
                     used_fraction: *fraction,
                     resets_at: None,
+                    title: None,
+                    amount: None,
                 })
                 .collect::<Vec<_>>(),
         }))

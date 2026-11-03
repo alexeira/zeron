@@ -88,7 +88,7 @@ use sha2::{Digest, Sha256};
 
 use zeron_proto::{
     AgentAccount, AgentAccountWarning, AgentAccountsSnapshot, AgentAuthKind, AgentLoginMode,
-    AgentLoginPoll, AgentLoginStart, AgentLoginStatus, AgentUsageWindow, HarnessId,
+    AgentLoginPoll, AgentLoginStart, AgentLoginStatus, AgentUsageWindow, HarnessId, UsageAmount,
 };
 
 use crate::repos::home_dir;
@@ -4237,6 +4237,8 @@ fn cursor_bucket_windows(body: &serde_json::Value) -> Vec<AgentUsageWindow> {
             label: label.to_string(),
             used_fraction: (percent / 100.0).clamp(0.0, 1.0) as f32,
             resets_at,
+            title: None,
+            amount: None,
         })
     })
     .collect()
@@ -4255,6 +4257,8 @@ fn cursor_grok_window(body: &serde_json::Value) -> Option<AgentUsageWindow> {
             .and_then(|v| v.as_str())
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|t| t.with_timezone(&Utc)),
+        title: None,
+        amount: None,
     })
 }
 
@@ -4279,6 +4283,8 @@ fn cursor_usage_window(body: &serde_json::Value) -> Option<AgentUsageWindow> {
         label: "Month".to_string(),
         used_fraction: (used / limit) as f32,
         resets_at: json_ms(body.get("billingCycleEnd")),
+        title: None,
+        amount: None,
     })
 }
 
@@ -5328,6 +5334,8 @@ mod probe_tests {
                 label: "5h".into(),
                 used_fraction: 0.4,
                 resets_at: None,
+                title: None,
+                amount: None,
             }],
             plan_label: None,
         }

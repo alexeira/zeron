@@ -382,6 +382,8 @@ impl Client {
                 label: label.into(),
                 used_fraction: used,
                 resets_at: Some(Utc::now() + chrono::Duration::hours(hours)),
+                title: None,
+                amount: None,
             };
             return Ok(Some((
                 vec![window("Session", 0.52, 2), window("Week", 0.27, 80)],

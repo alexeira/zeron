@@ -170,12 +170,41 @@ pub(crate) fn usage_resets(
 ) -> String {
     windows
         .iter()
-        .map(|window| match format_reset(window.resets_at, now) {
-            Some(reset) => format!("{}: {reset}", window.label),
-            None => window.label.clone(),
+        .map(|window| {
+            let reset = format_reset(window.resets_at, now);
+            if window.title.is_none() && window.amount.is_none() {
+                return match reset {
+                    Some(reset) => format!("{}: {reset}", window.label),
+                    None => window.label.clone(),
+                };
+            }
+            let mut parts = vec![window.title.clone().unwrap_or_else(|| window.label.clone())];
+            if let Some(amount) = &window.amount {
+                parts.push(format!(
+                    "{} / {}",
+                    compact_amount(amount.used),
+                    compact_amount(amount.limit)
+                ));
+            }
+            if let Some(reset) = reset {
+                parts.push(reset);
+            }
+            parts.join(" · ")
         })
         .collect::<Vec<_>>()
-        .join(" · ")
+        .join("\n")
+}
+
+fn compact_amount(n: f64) -> String {
+    if n >= 1e9 {
+        format!("{:.1}B", n / 1e9)
+    } else if n >= 1e6 {
+        format!("{:.1}M", n / 1e6)
+    } else if n >= 1e3 {
+        format!("{:.1}K", n / 1e3)
+    } else {
+        (n as i64).to_string()
+    }
 }
 
 pub use zeron_proto::providers::{
@@ -2453,18 +2482,42 @@ mod tests {
                 label: "Session".into(),
                 used_fraction: 0.07,
                 resets_at: Some(soon),
+                title: None,
+                amount: None,
             },
             zeron_proto::AgentUsageWindow {
                 label: "Week".into(),
                 used_fraction: 0.44,
                 resets_at: None,
+                title: None,
+                amount: None,
             },
         ];
         assert_eq!(
             usage_resets(&windows, now),
-            format!("Session: {} · Week", format_reset(Some(soon), now).unwrap())
+            format!("Session: {}\nWeek", format_reset(Some(soon), now).unwrap())
         );
         assert_eq!(usage_resets(&[], now), "");
+    }
+
+    #[test]
+    fn usage_resets_shows_a_titled_window_with_its_amount() {
+        let now = Utc::now();
+        let reset = now + TimeDelta::days(30);
+        let windows = [zeron_proto::AgentUsageWindow {
+            label: "DeepSeek".into(),
+            used_fraction: 0.25,
+            resets_at: Some(reset),
+            title: Some("DeepSeek V4 Flash".into()),
+            amount: Some(zeron_proto::UsageAmount {
+                used: 6_463_146.0,
+                limit: 1_000_000_000.0,
+                unit: "tokens".into(),
+            }),
+        }];
+        let text = usage_resets(&windows, now);
+        assert!(text.contains("DeepSeek V4 Flash · 6.5M / 1.0B"));
+        assert!(text.contains(&format_reset(Some(reset), now).unwrap()));
     }
 
     #[test]
@@ -2726,6 +2779,8 @@ mod tests {
                 label: "Session".into(),
                 used_fraction: 0.4,
                 resets_at: None,
+                title: None,
+                amount: None,
             }],
             usage_fetched_at: None,
             usage_error: None,
