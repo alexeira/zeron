@@ -369,6 +369,10 @@ impl AgentAccounts {
 
 pub(super) fn nan_usage_snapshot(body: &serde_json::Value) -> Option<UsageSnapshot> {
     let models = body.get("models")?.as_array()?;
+    let ids: Vec<String> = models
+        .iter()
+        .filter_map(|model| str_field(model, "model"))
+        .collect();
     let windows = models
         .iter()
         .filter_map(|model| {
@@ -377,8 +381,9 @@ pub(super) fn nan_usage_snapshot(body: &serde_json::Value) -> Option<UsageSnapsh
                 .and_then(json_f64)
                 .filter(|cap| *cap > 0.0)?;
             let used = model.get("tokensUsed").and_then(json_f64)?;
+            let id = str_field(model, "model")?;
             Some(AgentUsageWindow {
-                label: str_field(model, "model")?,
+                label: nan_model_label(&id, &ids),
                 used_fraction: (used / cap).clamp(0.0, 1.0) as f32,
                 resets_at: parse_when(model.get("periodEnd")),
             })
@@ -388,6 +393,39 @@ pub(super) fn nan_usage_snapshot(body: &serde_json::Value) -> Option<UsageSnapsh
         windows,
         plan_label: None,
     })
+}
+
+fn nan_model_family(id: &str) -> &str {
+    id.split(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or(id)
+}
+
+fn nan_model_label(id: &str, ids: &[String]) -> String {
+    let family = nan_model_family(id);
+    let name = match family {
+        "deepseek" => "DeepSeek",
+        "glm" => "GLM",
+        "qwen" => "Qwen",
+        "mimo" => "MiMo",
+        "gemma" => "Gemma",
+        "minimax" => "MiniMax",
+        _ => return id.to_string(),
+    };
+    let siblings: Vec<&String> = ids
+        .iter()
+        .filter(|other| nan_model_family(other) == family)
+        .collect();
+    let flash = siblings
+        .iter()
+        .filter(|other| other.contains("flash"))
+        .count();
+    match (siblings.len(), flash) {
+        (1, _) => name.to_string(),
+        (2, 1) if id.contains("flash") => format!("{name} F"),
+        (2, 1) => name.to_string(),
+        _ => id.to_string(),
+    }
 }
 
 /// Grok's `/billing?format=credits`: the current period, with the Grok Build

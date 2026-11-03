@@ -531,10 +531,10 @@ fn nan_slot(harness: HarnessId, key: String) -> Slot {
         harness,
         account_key,
         profile: SlotProfile {
-            email: format!("API key ·…{}", key_tail(&key)),
+            email: "NaN".to_string(),
             display_name: None,
             organization: None,
-            plan: Some("NaN".to_string()),
+            plan: Some(format!("API key ·…{}", key_tail(&key))),
             auth_kind: AgentAuthKind::ApiKey,
         },
         credentials: serde_json::json!({ "type": "api", "key": key }),

@@ -1211,7 +1211,7 @@ fn nan_usage_reads_each_models_share_of_its_cap() {
     let body: serde_json::Value = serde_json::from_str(NAN_QUOTA).unwrap();
     let snapshot = nan_usage_snapshot(&body).unwrap();
     let labels: Vec<_> = snapshot.windows.iter().map(|w| w.label.as_str()).collect();
-    assert_eq!(labels, ["deepseek-v4-flash", "glm5.3-flash"]);
+    assert_eq!(labels, ["DeepSeek", "GLM"]);
     assert!((snapshot.windows[0].used_fraction - 0.25).abs() < 1e-6);
     assert!((snapshot.windows[1].used_fraction - 0.1).abs() < 1e-6);
     assert_eq!(
@@ -1224,6 +1224,26 @@ fn nan_usage_reads_each_models_share_of_its_cap() {
         { "model": "free", "tokensUsed": 10, "cap": 0 },
         { "model": "over", "tokensUsed": 30, "cap": 20 },
     ]});
+    let siblings = serde_json::json!({ "models": [
+        { "model": "glm5.3", "tokensUsed": 1, "cap": 10 },
+        { "model": "glm5.3-flash", "tokensUsed": 1, "cap": 10 },
+        { "model": "qwen3.8-flash", "tokensUsed": 1, "cap": 10 },
+        { "model": "qwen3.6-flash", "tokensUsed": 1, "cap": 10 },
+        { "model": "unknown-model", "tokensUsed": 1, "cap": 10 },
+    ]});
+    let snapshot = nan_usage_snapshot(&siblings).unwrap();
+    let labels: Vec<_> = snapshot.windows.iter().map(|w| w.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        [
+            "GLM",
+            "GLM F",
+            "qwen3.8-flash",
+            "qwen3.6-flash",
+            "unknown-model"
+        ]
+    );
+
     let snapshot = nan_usage_snapshot(&uncapped).unwrap();
     assert_eq!(snapshot.windows.len(), 1);
     assert_eq!(snapshot.windows[0].used_fraction, 1.0);
@@ -1305,14 +1325,19 @@ async fn nan_keys_in_opencode_and_pi_configs_list_read_only_rows_with_quota_usag
         .iter()
         .map(|a| a.email.clone().unwrap())
         .collect();
-    assert_eq!(emails, ["API key ·…0001", "API key ·…0002"]);
+    assert_eq!(emails, ["NaN", "NaN"]);
+    let plans: Vec<_> = opencode_rows
+        .iter()
+        .map(|a| a.plan_label.clone().unwrap())
+        .collect();
+    assert_eq!(plans, ["API key ·…0001", "API key ·…0002"]);
     let pi_rows = rows(&snapshot, HarnessId::Pi);
     assert_eq!(pi_rows.len(), 1);
-    assert_eq!(pi_rows[0].email.as_deref(), Some("API key ·…0003"));
+    assert_eq!(pi_rows[0].plan_label.as_deref(), Some("API key ·…0003"));
     for row in opencode_rows.iter().chain(&pi_rows) {
         assert!(row.active && !row.switchable && row.saved_at.is_none());
         assert_eq!(row.provider.as_deref(), Some("nan"));
-        assert_eq!(row.plan_label.as_deref(), Some("NaN"));
+        assert_eq!(row.email.as_deref(), Some("NaN"));
         assert_eq!(row.auth_kind, Some(AgentAuthKind::ApiKey));
         assert_eq!(row.usage_error, None);
         let used: Vec<_> = row.usage_windows.iter().map(|w| w.used_fraction).collect();
