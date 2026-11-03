@@ -1690,6 +1690,24 @@ impl Repos {
             .await
     }
 
+    pub async fn create_folder(&self, path: String) -> Result<FolderListing, EngineError> {
+        let path = path.trim();
+        if !Path::new(path).is_absolute() {
+            return Err(EngineError::Other(
+                "The folder path must be absolute on the device.".into(),
+            ));
+        }
+        let target = PathBuf::from(path);
+        let worker = disposable_worker("folder-create", move || create_folder_blocking(&target));
+        match tokio::time::timeout(FOLDER_LIST_TIMEOUT, worker).await {
+            Ok(Some(result)) => result,
+            Ok(None) => Err(EngineError::Other("folder creation worker exited".into())),
+            Err(_) => Err(EngineError::Other(
+                "folder creation timed out on the device".into(),
+            )),
+        }
+    }
+
     // ── SearchHomeFolders ───────────────────────────────────────────────────
 
     /// Folders anywhere under home whose names match `query`, from the home
@@ -1850,6 +1868,37 @@ fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
         entries,
         truncated,
     })
+}
+
+fn create_folder_blocking(target: &Path) -> Result<FolderListing, EngineError> {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| EngineError::Other("That path doesn't name a folder to create.".into()))?;
+    match std::fs::create_dir(target) {
+        Ok(()) => list_folders_blocking(target),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if target.is_dir() {
+                list_folders_blocking(target)
+            } else {
+                Err(EngineError::Other(format!(
+                    "There's already a file named {name} there."
+                )))
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err(EngineError::Other(
+                "Zeron doesn't have access to create a folder there on the device.".into(),
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(EngineError::Other(
+            "The folder above doesn't exist on the device.".into(),
+        )),
+        Err(error) => Err(EngineError::Other(format!(
+            "could not create that folder: {error}"
+        ))),
+    }
 }
 
 /// The blocking drive walk. Best-effort everywhere: the list is navigation
@@ -3630,6 +3679,48 @@ tmpfs /run tmpfs rw 0 0
             .await;
         }
         assert!(repos.workspace_checkout(&root, &elsewhere).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_folder_makes_one_level_and_refuses_a_file_or_missing_parent() {
+        let data = tempfile::tempdir().unwrap();
+        let code = tempfile::tempdir().unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+        let site = code.path().join("site");
+        let listing = repos
+            .create_folder(site.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(listing.path, site.to_string_lossy().to_string());
+        assert!(site.is_dir());
+        assert_eq!(
+            repos
+                .create_folder(site.to_string_lossy().into_owned())
+                .await
+                .unwrap()
+                .path,
+            site.to_string_lossy().to_string()
+        );
+        let deep = code.path().join("a/b");
+        let error = repos
+            .create_folder(deep.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("above"), "{error}");
+        assert!(!deep.exists());
+        let error = repos
+            .create_folder("relative/site".into())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("absolute"), "{error}");
+        assert!(!Path::new("relative/site").exists());
+        std::fs::write(code.path().join("notes"), "").unwrap();
+        let error = repos
+            .create_folder(code.path().join("notes").to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("file named notes"), "{error}");
     }
 
     #[tokio::test]
