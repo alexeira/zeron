@@ -89,6 +89,16 @@ fn default_true() -> bool {
     true
 }
 
+fn login_state(harness: HarnessId, accounts: &[zeron_proto::AgentAccount]) -> Option<bool> {
+    let has_active_login = accounts.iter().any(|a| a.harness == harness && a.active);
+    let runs_without_detected_login = matches!(harness, HarnessId::Opencode | HarnessId::Pi);
+    match (has_active_login, runs_without_detected_login) {
+        (true, _) => Some(true),
+        (false, true) => None,
+        (false, false) => Some(false),
+    }
+}
+
 fn default_steering_mode() -> SteeringMode {
     SteeringMode::TurnBoundary
 }
@@ -302,12 +312,7 @@ impl Zeron {
             .and_then(|v| serde_json::from_value::<zeron_proto::AgentAccountsSnapshot>(v).ok());
         if let Some(snapshot) = accounts {
             for harness in &mut harnesses {
-                harness.signed_in = Some(
-                    snapshot
-                        .accounts
-                        .iter()
-                        .any(|a| a.harness == harness.id && a.active),
-                );
+                harness.signed_in = login_state(harness.id, &snapshot.accounts);
             }
         }
         Ok(harnesses)
@@ -734,6 +739,29 @@ pub fn short(id: &str) -> &str {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn agents_that_run_on_config_keys_or_free_models_are_never_known_signed_out() {
+        let account = |harness: &str, active: bool| -> zeron_proto::AgentAccount {
+            serde_json::from_value(json!({
+                "id": "a1", "harness": harness, "active": active,
+                "email": null, "planLabel": null
+            }))
+            .unwrap()
+        };
+        let none: Vec<zeron_proto::AgentAccount> = Vec::new();
+        assert_eq!(login_state(HarnessId::Pi, &none), None);
+        assert_eq!(login_state(HarnessId::Opencode, &none), None);
+        assert_eq!(login_state(HarnessId::ClaudeCode, &none), Some(false));
+        assert_eq!(
+            login_state(HarnessId::Opencode, &[account("opencode", false)]),
+            None
+        );
+        assert_eq!(
+            login_state(HarnessId::Pi, &[account("pi", true)]),
+            Some(true)
+        );
+    }
 
     #[tokio::test]
     async fn coalesced_repeated_interrupts_need_fresh_native_outcome_evidence() {
