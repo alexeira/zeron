@@ -13,7 +13,8 @@ needs no history, only the latest `ToolCall::Todo` part.
 
 | Harness | Source | In-progress |
 | --- | --- | --- |
-| Claude | `TodoWrite` | `in_progress` |
+| Claude | `TodoWrite`, enabled by `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` and `CLAUDE_CODE_ENABLE_TASKS=0` (Claude Code 2.1.268+ omits it on newer models) | `in_progress` |
+| Pi | `todo` from the `@juicesharp/rpiv-todo` extension; full list in the result's `details.tasks`, re-emitted under the same id, `deleted` dropped | `in_progress` |
 | OpenCode | `todowrite` | `in_progress` |
 | ACP (Gemini, Cursor, Devin, ...) | `plan` update, id `LIVE_PLAN_TOOL_ID` | `in_progress` |
 | Codex | `turn/plan/updated` (`update_plan`), id `LIVE_PLAN_TOOL_ID` | `inProgress` |
