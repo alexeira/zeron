@@ -451,6 +451,8 @@ impl ClaudeHarness {
         // stream-json`) forwards its own subagents' text too, which only
         // adds tagged frames to its stream.
         cmd.env("CLAUDE_CODE_FORWARD_SUBAGENT_TEXT", "1");
+        cmd.env("CLAUDE_CODE_ENABLE_TODO_TOOLS", "1");
+        cmd.env("CLAUDE_CODE_ENABLE_TASKS", "0");
         // Host-resolved environment (a Cloud device's `ANTHROPIC_API_KEY`
         // from the user's own key, `GH_TOKEN`, …). Never a Claude.ai
         // subscription token: those stay inside the CLI's own login.
@@ -2199,9 +2201,8 @@ mod tests {
         assert!(updated["questions"].is_array());
     }
 
-    #[test]
-    fn runs_ask_the_cli_to_forward_subagent_text() {
-        let request = RunRequest {
+    fn request() -> RunRequest {
+        RunRequest {
             mcp: None,
             prompt: "hi".into(),
             harness: None,
@@ -2217,14 +2218,38 @@ mod tests {
             worktree: None,
             resume: None,
             env: Default::default(),
-        };
-        let mut cmd = ClaudeHarness::build_command(std::path::Path::new("claude"), &request, false);
-        let value = cmd
-            .as_std_mut()
+        }
+    }
+
+    fn env_value(cmd: &mut Command, key: &str) -> Option<std::ffi::OsString> {
+        cmd.as_std_mut()
             .get_envs()
-            .find(|(key, _)| *key == "CLAUDE_CODE_FORWARD_SUBAGENT_TEXT")
-            .and_then(|(_, value)| value.map(|v| v.to_os_string()));
-        assert_eq!(value.as_deref(), Some(std::ffi::OsStr::new("1")));
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value.map(|v| v.to_os_string()))
+    }
+
+    #[test]
+    fn runs_ask_the_cli_to_forward_subagent_text() {
+        let mut cmd =
+            ClaudeHarness::build_command(std::path::Path::new("claude"), &request(), false);
+        assert_eq!(
+            env_value(&mut cmd, "CLAUDE_CODE_FORWARD_SUBAGENT_TEXT").as_deref(),
+            Some(std::ffi::OsStr::new("1"))
+        );
+    }
+
+    #[test]
+    fn runs_enable_the_task_tracking_tools_with_todo_write() {
+        let mut cmd =
+            ClaudeHarness::build_command(std::path::Path::new("claude"), &request(), false);
+        assert_eq!(
+            env_value(&mut cmd, "CLAUDE_CODE_ENABLE_TODO_TOOLS").as_deref(),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(
+            env_value(&mut cmd, "CLAUDE_CODE_ENABLE_TASKS").as_deref(),
+            Some(std::ffi::OsStr::new("0"))
+        );
     }
 }
 
