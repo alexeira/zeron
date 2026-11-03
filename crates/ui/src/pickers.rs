@@ -697,6 +697,40 @@ pub fn split_typed_leaf(text: &str, windows: bool) -> (&str, &str) {
     }
 }
 
+pub fn new_folder_offer(
+    text: &str,
+    base: Option<&str>,
+    home: Option<&str>,
+    windows: bool,
+    listed: Option<(&str, &[String])>,
+) -> Option<(String, String)> {
+    let (listed_path, names) = listed?;
+    let windows = windows || is_windows_path(text);
+    let path = resolve_typed_path(text, base, home, windows)?;
+    let (_, leaf) = split_typed_leaf(text, windows);
+    let name = if leaf.is_empty() {
+        path.rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    } else {
+        unescape_typed_path(leaf, windows)
+    };
+    if matches!(name.as_str(), "" | "." | "..") {
+        return None;
+    }
+    if parent_path(&path).is_none_or(|parent| !same_folder_path(&parent, listed_path)) {
+        return None;
+    }
+    if path.rsplit(['/', '\\']).next() != Some(name.as_str()) {
+        return None;
+    }
+    if names.iter().any(|entry| entry.eq_ignore_ascii_case(&name)) {
+        return None;
+    }
+    Some((path, name))
+}
+
 /// Breadcrumb segments for a path: `(label, full path)`, root first.
 pub fn breadcrumbs(path: &str) -> Vec<(String, String)> {
     if let Some(windows) = windows_browser_path(path) {
@@ -10748,6 +10782,78 @@ mod tests {
         want.insert("context".into(), serde_json::Value::String("1m".into()));
         assert_eq!(offered_options(&model, remembered), want);
         assert!(offered_options(&model, stale).is_empty());
+    }
+
+    #[test]
+    fn new_folder_offers_only_a_missing_name_under_the_listed_parent() {
+        let home = "/home/ana";
+        let names = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let code = names(&["docs", "site"]);
+        let empty = names(&[]);
+        let listing = Some(("/home/ana/code", code.as_slice()));
+        assert_eq!(
+            new_folder_offer("app", Some("/home/ana/code"), Some(home), false, listing),
+            Some(("/home/ana/code/app".into(), "app".into()))
+        );
+        assert_eq!(
+            new_folder_offer(
+                "~/code/app",
+                None,
+                Some(home),
+                false,
+                Some(("/home/ana/code", empty.as_slice()))
+            ),
+            Some(("/home/ana/code/app".into(), "app".into()))
+        );
+        assert_eq!(
+            new_folder_offer("app/", Some("/home/ana/code"), Some(home), false, listing),
+            Some(("/home/ana/code/app".into(), "app".into()))
+        );
+        assert_eq!(
+            new_folder_offer("..", Some("/home/ana/code"), Some(home), false, listing),
+            None
+        );
+        assert_eq!(
+            new_folder_offer("", Some("/home/ana/code"), Some(home), false, listing),
+            None
+        );
+        assert_eq!(
+            new_folder_offer("site", Some("/home/ana/code"), Some(home), false, listing),
+            None
+        );
+        assert_eq!(
+            new_folder_offer("Site", Some("/home/ana/code"), Some(home), false, listing),
+            None
+        );
+        assert_eq!(
+            new_folder_offer("app", Some("/home/ana"), Some(home), false, listing),
+            None
+        );
+        assert_eq!(
+            new_folder_offer(
+                "sub/app",
+                Some("/home/ana/code"),
+                Some(home),
+                false,
+                listing
+            ),
+            None
+        );
+        assert_eq!(
+            new_folder_offer("~/code/app", None, Some(home), false, None),
+            None
+        );
+        let drive = names(&["repo"]);
+        assert_eq!(
+            new_folder_offer(
+                r"D:\code\fresh",
+                None,
+                None,
+                true,
+                Some((r"D:\code", drive.as_slice()))
+            ),
+            Some((r"D:\code\fresh".into(), "fresh".into()))
+        );
     }
 
     #[test]

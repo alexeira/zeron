@@ -11,8 +11,8 @@
 use super::*;
 use crate::pickers::{
     breadcrumbs, browser_rows, completion_prefix_len, escape_typed_path, folder_path_key,
-    is_windows_path, parent_path, resolve_typed_path, same_folder_path, split_typed_leaf,
-    unescape_typed_path,
+    is_windows_path, new_folder_offer, parent_path, resolve_typed_path, same_folder_path,
+    split_typed_leaf, unescape_typed_path,
 };
 use gpui::{FocusHandle, Window};
 use std::collections::HashSet;
@@ -2736,6 +2736,10 @@ enum FolderRow {
     Local(zeron_proto::FolderEntry),
     /// A folder anywhere under home.
     Home(HomeFolderMatch),
+    Create {
+        path: String,
+        name: String,
+    },
     /// Clone a repository into the open folder: a pasted git URL, or one of
     /// the user's GitHub repositories matching the query.
     Clone(CloneRow),
@@ -6896,6 +6900,54 @@ impl Shell {
             .collect()
     }
 
+    fn add_space_new_folder(&self, cx: &App) -> Option<(String, String)> {
+        let flow = self.add_space.as_ref()?;
+        if flow.step != ProjectStep::Folders || flow.submit_busy {
+            return None;
+        }
+        let windows = self.add_space_windows_paths();
+        let base = flow.open_folder();
+        if let Some(edit) = flow.path_edit.as_ref() {
+            let text = edit.input.read(cx).text().to_owned();
+            let (folder, _) = split_typed_leaf(&text, windows);
+            let parent = if folder.is_empty() {
+                base.clone()
+            } else {
+                resolve_typed_path(folder, base.as_deref(), flow.home.as_deref(), windows)
+            }?;
+            let (key, siblings) = edit.siblings.as_ref()?;
+            let siblings = siblings.ready()?;
+            if *key != folder_path_key(&parent) {
+                return None;
+            }
+            let names: Vec<String> = siblings.iter().map(|entry| entry.name.clone()).collect();
+            return new_folder_offer(
+                &text,
+                base.as_deref(),
+                flow.home.as_deref(),
+                windows,
+                Some((&parent, &names)),
+            );
+        }
+        let listing = flow.browser.ready()?;
+        if flow.home_search.loading || flow.home_search.indexing {
+            return None;
+        }
+        let text = flow.search.read(cx).text().to_owned();
+        let names: Vec<String> = listing
+            .entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        new_folder_offer(
+            &text,
+            base.as_deref(),
+            flow.home.as_deref(),
+            windows,
+            Some((&listing.path, &names)),
+        )
+    }
+
     /// The Folders step's rows: the open folder's matching subfolders, then
     /// matches from anywhere under home not already listed.
     fn add_space_folder_rows(&self, cx: &App) -> Vec<FolderRow> {
@@ -6959,7 +7011,7 @@ impl Shell {
                 })
                 .collect()
         };
-        local
+        let rows: Vec<FolderRow> = local
             .into_iter()
             .map(FolderRow::Local)
             .chain(
@@ -6969,7 +7021,17 @@ impl Shell {
                     .map(FolderRow::Home),
             )
             .chain(github)
-            .collect()
+            .collect();
+        let Some((path, name)) = self.add_space_new_folder(cx) else {
+            return rows;
+        };
+        if flow.path_edit.is_some() || rows.is_empty() {
+            std::iter::once(FolderRow::Create { path, name })
+                .chain(rows)
+                .collect()
+        } else {
+            rows
+        }
     }
 
     /// Descend into the highlighted (filtered) folder; clears the query.
@@ -7014,6 +7076,7 @@ impl Shell {
         }
         let entry = match rows.get(flow.active) {
             Some(FolderRow::Local(entry)) => entry,
+            Some(FolderRow::Create { .. }) => return,
             Some(FolderRow::Home(found)) => {
                 let (path, is_repo) = (found.path.clone(), found.is_repo);
                 self.add_space_descend(path, is_repo, cx);
@@ -7217,6 +7280,19 @@ impl Shell {
         let path = listing.path.clone();
         let git_detected = flow.browser_repo;
         self.add_space_create(engine, device, path, git_detected, cx);
+    }
+
+    fn submit_add_space_or_create(&mut self, cx: &mut Context<Self>) {
+        let creating = self.add_space.as_ref().and_then(|flow| {
+            match self.add_space_folder_rows(cx).get(flow.active) {
+                Some(FolderRow::Create { path, .. }) => Some(path.clone()),
+                _ => None,
+            }
+        });
+        match creating {
+            Some(path) => self.add_space_create_folder(path, true, cx),
+            None => self.submit_add_space(cx),
+        }
     }
 
     /// Make `path` on `device` a project and land in it (an existing one for
@@ -7721,6 +7797,10 @@ impl Shell {
         let windows = self.add_space_windows_paths();
         let engine = self.state.read(cx).engine().cloned();
         let local = self.state.read(cx).local_device_id.clone();
+        if add && let Some((path, _)) = self.add_space_new_folder(cx) {
+            self.add_space_create_folder(path, add, cx);
+            return;
+        }
         let Some(flow) = self.add_space.as_mut() else {
             return;
         };
@@ -7821,14 +7901,24 @@ impl Shell {
         };
         edit.opening = false;
         let add = std::mem::take(&mut edit.adding);
-        let listing = match result {
-            Ok(listing) => listing,
+        match result {
+            Ok(listing) => self.add_space_show_listing(listing, add, cx),
             Err(error) => {
                 edit.error = Some(error.into());
                 edit.focus_pending = true;
                 cx.notify();
-                return;
             }
+        }
+    }
+
+    fn add_space_show_listing(
+        &mut self,
+        listing: FolderListing,
+        add: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(flow) = self.add_space.as_mut() else {
+            return;
         };
         let location = typed_path_location(
             &listing.path,
@@ -7851,6 +7941,8 @@ impl Shell {
         flow.load_task = None;
         flow.active = 0;
         flow.error = None;
+        flow.submit_busy = false;
+        flow.cloning = None;
         flow.list_scroll.set_offset(gpui::Point::default());
         let search = flow.search.clone();
         if leaves_home {
@@ -7866,6 +7958,66 @@ impl Shell {
         });
         if add {
             self.submit_add_space(cx);
+        }
+        cx.notify();
+    }
+
+    fn add_space_create_folder(&mut self, path: String, add: bool, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let local = self.state.read(cx).local_device_id.clone();
+        let Some(flow) = self.add_space.as_mut() else {
+            return;
+        };
+        if flow.submit_busy || flow.step != ProjectStep::Folders {
+            return;
+        }
+        let Some(device) = flow.device.clone() else {
+            return;
+        };
+        flow.submit_busy = true;
+        flow.error = None;
+        if let Some(edit) = flow.path_edit.as_mut() {
+            edit.error = None;
+            edit.opening = true;
+        }
+        let mut params = serde_json::Map::new();
+        params.insert("path".into(), serde_json::Value::String(path));
+        add_space_target(&mut params, Some(&device.id), local.as_deref());
+        let task = cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call_as::<FolderListing>(methods::CREATE_FOLDER, params.into())
+                .await;
+            this.update(cx, |shell, cx| match result {
+                Ok(listing) => shell.add_space_show_listing(listing, add, cx),
+                Err(zeron_rpc::RpcError::UnknownMethod(_)) => shell.add_space_create_failed(
+                    "This device's Zeron doesn't support creating folders yet.".into(),
+                    cx,
+                ),
+                Err(error) => shell.add_space_create_failed(error.to_string(), cx),
+            })
+            .ok();
+        });
+        if let Some(flow) = self.add_space.as_mut() {
+            flow.submit_task = Some(task);
+        }
+        cx.notify();
+    }
+
+    fn add_space_create_failed(&mut self, error: String, cx: &mut Context<Self>) {
+        let Some(flow) = self.add_space.as_mut() else {
+            return;
+        };
+        flow.submit_busy = false;
+        let error: SharedString = error.into();
+        if let Some(edit) = flow.path_edit.as_mut() {
+            edit.opening = false;
+            edit.error = Some(error);
+            edit.focus_pending = true;
+        } else {
+            flow.error = Some(error);
         }
         cx.notify();
     }
@@ -7957,14 +8109,8 @@ impl Shell {
                     cx.notify();
                 }
             }
-            // ⏎ opens the highlighted folder (an alias for →); the space is
-            // added with ⌘⏎ — and the chord acts on the folder OPEN in the
-            // breadcrumbs, not the highlight. The highlight auto-rests on the
-            // first row, so a chord that took it would add arbitrary
-            // subfolders; the usual target (a repo root full of subfolders)
-            // is only ever "the folder you're standing in".
             popover::MenuKey::Enter => self.add_space_open_active(cx),
-            popover::MenuKey::ModEnter => self.submit_add_space(cx),
+            popover::MenuKey::ModEnter => self.submit_add_space_or_create(cx),
             popover::MenuKey::Backspace => {
                 let empty = self
                     .add_space
@@ -8131,6 +8277,7 @@ impl Shell {
             ))
         };
         let mut rows: Vec<AnyElement> = Vec::new();
+        let mut create_offered = false;
         match step {
             ProjectStep::Devices => {
                 for (ix, device) in self.add_space_devices(cx).into_iter().enumerate() {
@@ -8249,6 +8396,25 @@ impl Shell {
                                 } else {
                                     el.into_any_element()
                                 });
+                                continue;
+                            }
+                            FolderRow::Create { path, name } => {
+                                create_offered = true;
+                                let path = path.clone();
+                                let label = SharedString::from(format!("Create folder {name}"));
+                                rows.push(
+                                    row(ix)
+                                        .child(glyph_el(icons::PLUS))
+                                        .child(div().flex_1().min_w_0().truncate().child(label))
+                                        .child(popover::kbd_hint(
+                                            &theme,
+                                            &crate::settings::badge_combo("mod-enter"),
+                                        ))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.add_space_create_folder(path.clone(), true, cx)
+                                        }))
+                                        .into_any_element(),
+                                );
                                 continue;
                             }
                             FolderRow::Local(entry) => entry,
@@ -8794,6 +8960,17 @@ impl Shell {
                 Some((input, opening, _)) => !opening && !input.read(cx).text().trim().is_empty(),
                 None => listing.is_some(),
             };
+        let creating = if editing {
+            self.add_space_new_folder(cx).is_some()
+        } else {
+            create_offered
+        };
+        let add_label = match (&cloning, busy) {
+            (Some(label), _) => format!("Cloning {label}…"),
+            (None, true) => "Adding…".to_string(),
+            (None, false) if creating => "Create project".to_string(),
+            (None, false) => "Add project".to_string(),
+        };
         let footer = if editing {
             command_palette::palette_footer()
                 .child(command_palette::command_key_hint(
@@ -8810,15 +8987,23 @@ impl Shell {
         } else {
             command_palette::palette_footer()
                 .child(command_palette::command_key_hint(&theme, "↑ ↓", "Navigate"))
-                .child(command_palette::command_key_hint(
-                    &theme,
-                    "↵",
-                    match step {
-                        ProjectStep::Folders => "Open",
-                        ProjectStep::Repositories => "Add",
-                        _ => "Select",
-                    },
-                ))
+                .child(if creating {
+                    command_palette::command_key_hint(
+                        &theme,
+                        &crate::settings::badge_combo("mod-enter"),
+                        "Create folder",
+                    )
+                } else {
+                    command_palette::command_key_hint(
+                        &theme,
+                        "↵",
+                        match step {
+                            ProjectStep::Folders => "Open",
+                            ProjectStep::Repositories => "Add",
+                            _ => "Select",
+                        },
+                    )
+                })
                 .when(step != ProjectStep::Devices, |el| {
                     el.child(command_palette::command_key_hint(&theme, "←", "Back"))
                 })
@@ -8848,7 +9033,7 @@ impl Shell {
                     .mr(px(-8.0))
                     .rounded(px(8.0))
                     .role(gpui::Role::Button)
-                    .aria_label("Add project")
+                    .aria_label(SharedString::from(add_label.clone()))
                     .when(can_add, |el| {
                         el.cursor_pointer()
                             .hover(|s| s.bg(crate::theme::card_selected_bg()))
@@ -8857,7 +9042,7 @@ impl Shell {
                                 if editing {
                                     this.add_space_open_typed_path(true, cx)
                                 } else {
-                                    this.submit_add_space(cx)
+                                    this.submit_add_space_or_create(cx)
                                 }
                             }))
                     })
@@ -8871,11 +9056,7 @@ impl Shell {
                             .text_size(crate::typography::ui_rems(10.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)
-                            .child(SharedString::from(match (&cloning, busy) {
-                                (Some(label), _) => format!("Cloning {label}…"),
-                                (None, true) => "Adding…".to_string(),
-                                (None, false) => "Add project".to_string(),
-                            })),
+                            .child(SharedString::from(add_label)),
                     ),
             )
         });
@@ -10308,6 +10489,110 @@ mod home_folder_search_tests {
             })
             .unwrap();
         assert!(engine.take(methods::MUTATE, cx).is_empty(), "↵ only opens");
+    }
+
+    #[gpui::test]
+    fn a_missing_folder_name_creates_it_on_the_chosen_device(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = picker(cx, "remote");
+        go_home(window, cx);
+        let warm = engine.take(methods::SEARCH_HOME_FOLDERS, cx);
+        engine.reply(
+            &warm[0],
+            serde_json::json!({ "matches": [], "indexing": false }),
+        );
+        type_query(window, "brand-new", cx);
+        let search = engine.take(methods::SEARCH_HOME_FOLDERS, cx);
+        assert_eq!(search.len(), 1);
+        engine.reply(
+            &search[0],
+            serde_json::json!({ "matches": [], "indexing": false }),
+        );
+        cx.run_until_parked();
+        window
+            .read_with(cx, |shell, cx| {
+                assert_eq!(
+                    shell.add_space_folder_rows(cx),
+                    vec![FolderRow::Create {
+                        path: "/home/me/brand-new".into(),
+                        name: "brand-new".into(),
+                    }]
+                );
+            })
+            .unwrap();
+        press(window, "enter", gpui::Modifiers::none(), cx);
+        assert!(engine.take(methods::CREATE_FOLDER, cx).is_empty());
+        assert!(engine.take(methods::MUTATE, cx).is_empty());
+        window
+            .read_with(cx, |shell, cx| {
+                assert!(shell.state.read(cx).spaces.is_empty());
+                assert!(matches!(
+                    shell.add_space_folder_rows(cx).as_slice(),
+                    [FolderRow::Create { .. }]
+                ));
+            })
+            .unwrap();
+        press(window, "enter", gpui::Modifiers::secondary_key(), cx);
+        let create = engine.take(methods::CREATE_FOLDER, cx);
+        assert_eq!(create.len(), 1);
+        assert_eq!(create[0]["params"]["path"], "/home/me/brand-new");
+        assert_eq!(create[0]["params"]["targetDeviceId"], "remote");
+        engine.fail(
+            &create[0],
+            "Zeron doesn't have access to create a folder there on the device.",
+        );
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                let flow = shell.add_space.as_ref().unwrap();
+                assert!(!flow.submit_busy);
+                assert_eq!(
+                    flow.error.as_deref(),
+                    Some("Zeron doesn't have access to create a folder there on the device.")
+                );
+                assert!(shell.state.read(cx).spaces.is_empty());
+                shell.add_space.as_mut().unwrap().error = None;
+            })
+            .unwrap();
+        press(window, "enter", gpui::Modifiers::secondary_key(), cx);
+        let retry = engine.take(methods::CREATE_FOLDER, cx);
+        assert_eq!(retry.len(), 1);
+        engine.reply(
+            &retry[0],
+            serde_json::json!({ "path": "/home/me/brand-new", "entries": [] }),
+        );
+        cx.run_until_parked();
+        let created = engine.take(methods::MUTATE, cx);
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0]["params"]["op"], "createSpace");
+        assert_eq!(created[0]["params"]["deviceId"], "remote");
+        assert_eq!(created[0]["params"]["path"], "/home/me/brand-new");
+    }
+
+    #[gpui::test]
+    fn mod_enter_creates_a_missing_typed_path_on_the_device(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = picker(cx, "remote");
+        go_home(window, cx);
+        engine.take(methods::SEARCH_HOME_FOLDERS, cx);
+        press(window, "l", gpui::Modifiers::secondary_key(), cx);
+        type_path(window, "~/code/new", cx);
+        let parent = listing_request(&mut engine, "/home/me/code", cx);
+        engine.reply(
+            &parent,
+            serde_json::json!({ "path": "/home/me/code", "entries": [] }),
+        );
+        cx.run_until_parked();
+        press(window, "enter", gpui::Modifiers::secondary_key(), cx);
+        let create = engine.take(methods::CREATE_FOLDER, cx);
+        assert_eq!(create.len(), 1);
+        assert_eq!(create[0]["params"]["path"], "/home/me/code/new");
+        assert_eq!(create[0]["params"]["targetDeviceId"], "remote");
+        engine.reply(
+            &create[0],
+            serde_json::json!({ "path": "/home/me/code/new", "entries": [] }),
+        );
+        let created = engine.take(methods::MUTATE, cx);
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0]["params"]["path"], "/home/me/code/new");
     }
 
     #[gpui::test]

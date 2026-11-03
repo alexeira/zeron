@@ -337,6 +337,12 @@ struct ListFoldersParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct CreateFolderParams {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct FileSearchParams {
     query: String,
     #[serde(default)]
@@ -2195,6 +2201,7 @@ fn forwardable(method: &str) -> bool {
             | methods::FETCH_ALL
             | methods::SWITCH_REF
             | methods::LIST_FOLDERS
+            | methods::CREATE_FOLDER
             | methods::GET_WORKTREE_SETTINGS
             | methods::SET_WORKTREE_SETTINGS
             | methods::LIST_DRIVES
@@ -4168,6 +4175,15 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&listing)
             }
+            methods::CREATE_FOLDER => {
+                let p: CreateFolderParams = parse_params(params)?;
+                let listing = self
+                    .repos
+                    .create_folder(p.path)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&listing)
+            }
             methods::SEARCH_HOME_FOLDERS => {
                 let request: zeron_proto::SearchHomeFoldersRequest = parse_params(params)?;
                 if request.query.chars().count() > 256 {
@@ -5377,6 +5393,8 @@ mod tests {
         assert!(forwardable(methods::SEARCH_WORKSPACE_CONTENT));
         assert!(!is_stream_method(methods::SEARCH_WORKSPACE_CONTENT));
         assert!(forwardable(methods::SEARCH_HOME_FOLDERS));
+        assert!(forwardable(methods::CREATE_FOLDER));
+        assert!(!is_stream_method(methods::CREATE_FOLDER));
         assert!(forwardable(methods::RELEASE_HOME_FOLDER_SEARCH));
         assert!(!is_stream_method(methods::READ_WORKSPACE_FILE));
         assert!(!is_stream_method(methods::WRITE_WORKSPACE_FILE));
