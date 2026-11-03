@@ -1,6 +1,6 @@
 use serde_json::Value;
 use std::collections::HashMap;
-use zeron_proto::{AgentEvent, DoneStatus, ToolCall, ToolDiff};
+use zeron_proto::{AgentEvent, DoneStatus, TodoItem, TodoStatus, ToolCall, ToolDiff};
 
 #[derive(Default)]
 pub(super) struct Normalizer {
@@ -139,6 +139,15 @@ impl Normalizer {
                         _ => None,
                     }
                 });
+                if !frame["isError"].as_bool().unwrap_or(false)
+                    && info.as_ref().is_some_and(|(name, _)| name == "todo")
+                    && let Some(items) = todo_items(&result["details"]["tasks"])
+                {
+                    events.push(AgentEvent::ToolCall {
+                        id: id.clone(),
+                        call: ToolCall::Todo { items },
+                    });
+                }
                 events.push(AgentEvent::ToolResult {
                     id,
                     is_error: frame["isError"].as_bool().unwrap_or(false),
@@ -178,6 +187,21 @@ fn cap(text: &str, limit: usize) -> String {
         at -= 1;
     }
     format!("{}\n… [truncated]", &text[..at])
+}
+fn todo_items(tasks: &Value) -> Option<Vec<TodoItem>> {
+    Some(
+        tasks
+            .as_array()?
+            .iter()
+            .filter(|task| string(task, "status") != "deleted")
+            .map(|task| {
+                TodoItem::new(
+                    string(task, "subject"),
+                    TodoStatus::parse(string(task, "status")),
+                )
+            })
+            .collect(),
+    )
 }
 fn tool(name: &str, args: &Value) -> ToolCall {
     match name {
@@ -236,6 +260,71 @@ mod tests {
             matches!(&events[0], AgentEvent::Error {message} if message == "Pi extension: boom")
         );
         assert_eq!(n.status(), DoneStatus::Completed);
+    }
+    fn todo_end(id: &str, is_error: bool, tasks: Value) -> Value {
+        json!({"type":"tool_execution_end","toolCallId":id,"toolName":"todo","isError":is_error,"result":{"content":[{"type":"text","text":"Created #1"}],"details":{"action":"create","params":{},"tasks":tasks,"nextId":3}}})
+    }
+    #[test]
+    fn todo_calls_emit_the_full_list_before_the_result() {
+        let mut n = Normalizer::default();
+        n.map(&json!({"type":"tool_execution_start","toolCallId":"t1","toolName":"todo","args":{"action":"create","subject":"read code"}}));
+        let events = n.map(&todo_end(
+            "t1",
+            false,
+            json!([{"id":1,"subject":"read code","status":"in_progress"}]),
+        ));
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            AgentEvent::ToolCall {
+                id: "t1".into(),
+                call: ToolCall::Todo {
+                    items: vec![TodoItem::new("read code", TodoStatus::InProgress)]
+                }
+            }
+        );
+        assert!(matches!(&events[1], AgentEvent::ToolResult{id,is_error:false,..} if id=="t1"));
+        n.map(&json!({"type":"tool_execution_start","toolCallId":"t2","toolName":"todo","args":{"action":"update","id":1,"status":"completed"}}));
+        let events = n.map(&todo_end("t2", false, json!([{"id":1,"subject":"read code","status":"completed"},{"id":2,"subject":"write fix","status":"pending"}])));
+        assert_eq!(
+            events[0],
+            AgentEvent::ToolCall {
+                id: "t2".into(),
+                call: ToolCall::Todo {
+                    items: vec![
+                        TodoItem::new("read code", TodoStatus::Completed),
+                        TodoItem::new("write fix", TodoStatus::Pending),
+                    ]
+                }
+            }
+        );
+    }
+    #[test]
+    fn todo_deleted_items_are_skipped() {
+        let mut n = Normalizer::default();
+        n.map(&json!({"type":"tool_execution_start","toolCallId":"t","toolName":"todo","args":{"action":"delete","id":1}}));
+        let events = n.map(&todo_end("t", false, json!([{"id":1,"subject":"gone","status":"deleted"},{"id":2,"subject":"keep","status":"pending"}])));
+        assert_eq!(
+            events[0],
+            AgentEvent::ToolCall {
+                id: "t".into(),
+                call: ToolCall::Todo {
+                    items: vec![TodoItem::new("keep", TodoStatus::Pending)]
+                }
+            }
+        );
+    }
+    #[test]
+    fn todo_error_result_emits_no_todo() {
+        let mut n = Normalizer::default();
+        n.map(&json!({"type":"tool_execution_start","toolCallId":"t","toolName":"todo","args":{"action":"bogus"}}));
+        let events = n.map(&todo_end(
+            "t",
+            true,
+            json!([{"id":1,"subject":"a","status":"pending"}]),
+        ));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], AgentEvent::ToolResult{id,is_error:true,..} if id=="t"));
     }
     #[test]
     fn tools_preserve_identity_and_edit_diff() {
